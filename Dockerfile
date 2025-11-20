@@ -1,4 +1,6 @@
+
 FROM python:3.11-slim
+RUN echo "BUILD-TIME DB_USER=$DB_USER"
 
 WORKDIR /app
 
