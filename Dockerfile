@@ -7,23 +7,17 @@ RUN apt-get update && apt-get install -y \
     gcc \
     libpq-dev \
     python3-dev \
+    postgresql-client \
     && rm -rf /var/lib/apt/lists/*
 
-# Install Python dependencies
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-RUN rm -f .env || true
-
-
-# Copy backend code
 COPY . .
 
-# Expose Django port
+# Delete ANY .env file inside project
+RUN find /app -name ".env" -delete || true
+
 EXPOSE 7860
 
-RUN rm -f .env || true
-
-
-# Use entrypoint to migrate + run server
 CMD ["sh", "entrypoint.sh"]
