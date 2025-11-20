@@ -19,5 +19,8 @@ COPY . .
 # Expose Django port
 EXPOSE 7860
 
+RUN rm -f .env || true
+
+
 # Use entrypoint to migrate + run server
 CMD ["sh", "entrypoint.sh"]
