@@ -2,25 +2,22 @@ FROM python:3.11-slim
 
 WORKDIR /app
 
-# Install system dependencies for numpy, faiss, psycopg2
-RUN apt-get update && apt-get install -y --no-install-recommends \
-    build-essential \
-    g++ \
+# Install PostgreSQL client + required build deps
+RUN apt-get update && apt-get install -y \
+    gcc \
     libpq-dev \
+    python3-dev \
     && rm -rf /var/lib/apt/lists/*
 
-# Install python packages
+# Install Python dependencies
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-# Copy project files
+# Copy backend code
 COPY . .
 
-# Ensure entrypoint is executable
-RUN chmod +x /app/entrypoint.sh
-
-# Expose HuggingFace port
+# Expose Django port
 EXPOSE 7860
 
-# Start server
-CMD ["bash", "/app/entrypoint.sh"]
+# Use entrypoint to migrate + run server
+CMD ["sh", "entrypoint.sh"]
