@@ -1,6 +1,7 @@
-
 FROM python:3.11-slim
-RUN echo "BUILD-TIME DB_USER=$DB_USER"
+
+# Force IPv4 for all DNS lookups
+RUN echo "precedence ::ffff:0:0/96  100" >> /etc/gai.conf
 
 WORKDIR /app
 
