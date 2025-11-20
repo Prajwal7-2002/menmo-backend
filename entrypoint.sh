@@ -12,6 +12,16 @@ echo "GROQ_API_KEY=$GROQ_API_KEY"
 
 echo "==========================================================="
 
+echo "====== Testing manual DB login inside container ======"
+PGPASSWORD="$DB_PASSWORD" psql \
+  --host="$DB_HOST" \
+  --username="$DB_USER" \
+  --dbname="$DB_NAME" \
+  -c "SELECT NOW();" || echo "❌ MANUAL DB CONNECT FAILED INSIDE CONTAINER"
+echo "======================================================"
+
+
+
 echo "Applying migrations..."
 python manage.py migrate --noinput
 
