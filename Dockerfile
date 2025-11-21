@@ -23,4 +23,6 @@ RUN find /app -name ".env" -delete || true
 
 EXPOSE 7860
 
-CMD ["sh", "entrypoint.sh"]
+CMD ["sh", "entrypoint.sh","python", "manage.py", "runserver", "0.0.0.0:7860"]
+
+
