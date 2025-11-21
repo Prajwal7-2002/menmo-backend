@@ -101,6 +101,8 @@ WSGI_APPLICATION = 'copilot_backend.wsgi.application'
 # -----------------------------
 # DATABASE CONFIG (Supabase)
 # -----------------------------
+
+
 DATABASES = {
     "default": {
         "ENGINE": "django.db.backends.postgresql",
@@ -112,7 +114,7 @@ DATABASES = {
         "CONN_MAX_AGE": 60,
         "OPTIONS": {
             "sslmode": "require",
-            "sslmode": "verify-full",
+            "sslrootcert": "system",
         },
     }
 }
