@@ -1,14 +1,11 @@
 FROM python:3.11-slim
 
-# Force IPv4 for all DNS lookups
 RUN echo "precedence ::ffff:0:0/96  100" >> /etc/gai.conf
 
 WORKDIR /app
 
-# Install PostgreSQL client + required build deps
 RUN apt-get update && apt-get install -y \
     gcc \
-    libpq-dev \
     python3-dev \
     postgresql-client \
     && rm -rf /var/lib/apt/lists/*
@@ -18,11 +15,9 @@ RUN pip install --no-cache-dir -r requirements.txt
 
 COPY . .
 
-# Delete ANY .env file inside project
 RUN find /app -name ".env" -delete || true
 
 EXPOSE 7860
 
-CMD ["sh", "entrypoint.sh","python", "manage.py", "runserver", "0.0.0.0:7860"]
-
-
+ENTRYPOINT ["sh", "entrypoint.sh"]
+CMD ["python", "manage.py", "runserver", "0.0.0.0:7860"]
