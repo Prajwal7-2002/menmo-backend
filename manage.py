@@ -3,6 +3,14 @@
 import os
 import sys
 
+# ---------------------------
+# DEBUG ENV PRINT (VERY IMPORTANT)
+# ---------------------------
+print("MANAGE.PY ENV:", {
+    "DB_USER": os.getenv("DB_USER"),
+    "DB_PASSWORD": os.getenv("DB_PASSWORD"),
+    "DB_HOST": os.getenv("DB_HOST")
+})
 
 def main():
     """Run administrative tasks."""
