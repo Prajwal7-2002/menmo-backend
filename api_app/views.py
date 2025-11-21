@@ -49,15 +49,29 @@ class AnalyticsAPIView(APIView):
     permission_classes = [IsAuthenticated]
 
     def get(self, request):
-        total = QueryLog.objects.count()
-        today = QueryLog.objects.filter(created_at__date=timezone.now().date()).count()
-        avg_score = QueryLog.objects.aggregate(avg=Avg("top_score"))["avg"] or 0.0
-        up = Feedback.objects.filter(value="up").count()
-        down = Feedback.objects.filter(value="down").count()
+        user = request.user
+        
+        # Only this user's logs
+        user_logs = QueryLog.objects.filter(user=user)
 
-        top_queries = QueryLog.objects.values("query").annotate(
-            count=Count("id")
-        ).order_by("-count")[:10]
+        total = user_logs.count()
+
+        today = user_logs.filter(
+            created_at__date=timezone.now().date()
+        ).count()
+
+        avg_score = user_logs.aggregate(avg=Avg("top_score"))["avg"] or 0.0
+
+        # Only this user's feedback
+        fb = Feedback.objects.filter(user=user)
+        up = fb.filter(value="up").count()
+        down = fb.filter(value="down").count()
+
+        top_queries = (
+            user_logs.values("query")
+            .annotate(count=Count("id"))
+            .order_by("-count")[:10]
+        )
 
         return Response({
             "total_queries": total,
