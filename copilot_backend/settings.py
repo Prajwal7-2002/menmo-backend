@@ -114,6 +114,8 @@ DATABASES = {
         "CONN_MAX_AGE": 0,
         "OPTIONS": {
             "sslmode": "require",
+            "connect_timeout": 5,
+            "application_name": "neurostack_backend"
         },
     }
 }
