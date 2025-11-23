@@ -21,6 +21,9 @@ from rag.loader import index_document
 # ---------------------------------------
 # 🟦  ASK API
 # ---------------------------------------
+# ---------------------------------------
+# 🟦  ASK API (supports optional document)
+# ---------------------------------------
 class AskAPIView(APIView):
     permission_classes = [IsAuthenticated]
 
@@ -29,12 +32,15 @@ class AskAPIView(APIView):
         serializer.is_valid(raise_exception=True)
 
         query = serializer.validated_data["query"]
-        active_domain = request.session.get("active_domain")
+
+        active_domain = request.session.get("active_domain", None)
+        document_id = request.data.get("document_id")  # optional
 
         result = run_rag(
             query,
             user_id=request.user.id,
-            domain=active_domain
+            domain=active_domain,
+            document_id=document_id   # <<< NEW
         )
 
         top_score = result["chunks"][0]["score"] if result.get("chunks") else 0.0
@@ -49,7 +55,8 @@ class AskAPIView(APIView):
         )
 
         return Response({"query_id": str(qlog.id), **result})
-    
+
+
 
 # ---------------------------------------
 # 🟩  FEEDBACK API
