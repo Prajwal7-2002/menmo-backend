@@ -2,23 +2,19 @@ import os
 from pathlib import Path
 from datetime import timedelta
 
-# -----------------------------
-# DEBUG: Print loaded environment variables
-# -----------------------------
-print("DEBUG FULL ENV:", {
-    "DB_USER": repr(os.getenv("DB_USER")),
-    "DB_PASSWORD": repr(os.getenv("DB_PASSWORD")),
-    "DB_HOST": repr(os.getenv("DB_HOST")),
-    "DB_NAME": repr(os.getenv("DB_NAME")),
-    "DB_PORT": repr(os.getenv("DB_PORT")),
-})
-if os.getenv("DB_USER") is None or os.getenv("DB_USER").strip() == "":
-    raise Exception("❌ DB_USER IS EMPTY INSIDE DJANGO (ENV NOT PASSED)")
-
-
-
 # Base directory
 BASE_DIR = Path(__file__).resolve().parent.parent
+
+# -------------------------------------------
+# SELECT RUNTIME MODE (LOCAL VS HUGGINGFACE)
+# -------------------------------------------
+
+IS_LOCAL = (
+    os.getenv("HF_ENV") is None   # HF sets HF_ENV automatically
+    and (os.getenv("DB_HOST") in [None, "", "None"])
+)
+
+print("🔧 Running mode:", "LOCAL" if IS_LOCAL else "HUGGINGFACE PROD")
 
 # -----------------------------
 # GROQ CONFIG
@@ -29,9 +25,8 @@ GROQ_MODEL = os.getenv("GROQ_MODEL", "llama-3.3-70b-versatile")
 # -----------------------------
 # SECURITY SETTINGS
 # -----------------------------
-SECRET_KEY = os.getenv("SECRET_KEY")
-
-DEBUG = False
+SECRET_KEY = os.getenv("SECRET_KEY", "local-secret-key")
+DEBUG = IS_LOCAL
 ALLOWED_HOSTS = ["*"]
 
 # -----------------------------
@@ -51,6 +46,7 @@ INSTALLED_APPS = [
 
     'auth_app',
     'api_app',
+    'rag',
 ]
 
 REST_FRAMEWORK = {
@@ -98,28 +94,36 @@ TEMPLATES = [
 
 WSGI_APPLICATION = 'copilot_backend.wsgi.application'
 
-# -----------------------------
-# DATABASE CONFIG (Supabase)
-# -----------------------------
+# -------------------------------------------
+# DATABASE CONFIG
+# -------------------------------------------
 
-
-DATABASES = {
-    "default": {
-        "ENGINE": "django.db.backends.postgresql",
-        "NAME": os.getenv("DB_NAME"),
-        "USER": os.getenv("DB_USER"),
-        "PASSWORD": os.getenv("DB_PASSWORD"),
-        "HOST": os.getenv("DB_HOST"),
-        "PORT": os.getenv("DB_PORT", "5432"),
-        "CONN_MAX_AGE": 0,
-        "OPTIONS": {
-            "sslmode": "require",
-            "connect_timeout": 5,
-            "application_name": "neurostack_backend"
-        },
+if IS_LOCAL:
+    print("⚠ Using LOCAL SQLite database")
+    DATABASES = {
+        "default": {
+            "ENGINE": "django.db.backends.sqlite3",
+            "NAME": BASE_DIR / "db.sqlite3",
+        }
     }
-}
-
+else:
+    print("🚀 Using SUPABASE PostgreSQL")
+    DATABASES = {
+        "default": {
+            "ENGINE": "django.db.backends.postgresql",
+            "NAME": os.getenv("DB_NAME"),
+            "USER": os.getenv("DB_USER"),
+            "PASSWORD": os.getenv("DB_PASSWORD"),
+            "HOST": os.getenv("DB_HOST"),
+            "PORT": os.getenv("DB_PORT", "5432"),
+            "CONN_MAX_AGE": 0,
+            "OPTIONS": {
+                "sslmode": "require",
+                "connect_timeout": 5,
+                "application_name": "neurostack_backend"
+            },
+        }
+    }
 
 # -----------------------------
 # PASSWORD VALIDATION
