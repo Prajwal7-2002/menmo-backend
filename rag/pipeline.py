@@ -1,4 +1,3 @@
-# rag/pipeline.py
 from typing import Optional, Dict, Any, List
 
 from .retrieval import retrieve, MIN_SCORE_THRESHOLD
@@ -15,26 +14,19 @@ def run_rag(
     query: str,
     user_id: Optional[int] = None,
     domain: Optional[str] = None,
+    document_id: Optional[str] = None,   # <<< NEW
     max_chunks: int = 4,
 ) -> Dict[str, Any]:
     """
     Main RAG pipeline.
-
-    Returns:
-    {
-        "answer": str,
-        "validated": bool,
-        "chunks": [ {text, score, meta, ...}, ... ],
-        "reason": str (optional),
-        "note": str (optional)
-    }
     """
 
-    # 1) Retrieval (hybrid)
+    # 1) Retrieval (hybrid, domain + OPTIONAL document)
     candidates: List[Dict[str, Any]] = retrieve(
         query=query,
         user_id=user_id,
         domain=domain,
+        document_id=document_id,   # <<< PASS IT HERE
         top_k=max_chunks * 2,
     )
 
@@ -46,10 +38,9 @@ def run_rag(
             "reason": "no_relevant_documents",
         }
 
-    # 2) Validation: score threshold
+    # 2) Score validation
     top = candidates[0]
     if top["score"] < MIN_SCORE_THRESHOLD:
-        # Low-context / irrelevant → block hallucination
         return {
             "answer": REPHRASE_MSG,
             "validated": False,
@@ -57,16 +48,14 @@ def run_rag(
             "reason": "low_relevance",
         }
 
-    # 3) Select chunks for context
+    # 3) Pick chunks
     chosen = candidates[:max_chunks]
     context = "\n\n---\n\n".join([c["text"] for c in chosen])
 
-    # 4) Call LLM for grounded answer
+    # 4) LLM grounding
     try:
         llm_answer = call_llm_answer(query, context)
-
         if not llm_answer or llm_answer.strip() == "":
-            # fallback to top chunk text
             fallback = chosen[0]["text"]
             return {
                 "answer": fallback,
