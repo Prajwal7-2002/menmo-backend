@@ -9,35 +9,29 @@ from .llm import detect_domain_llm
 from .models import UploadedDocument, DocumentChunk
 
 
-# ---------------------- File text extraction ----------------------
-
+# ============================================================
+#  TEXT EXTRACTION HELPERS
+# ============================================================
 
 def extract_text_from_pdf(path: str) -> List[Tuple[int, str]]:
-    """
-    Returns list of (page_number, text) from a PDF.
-    Tries pdfplumber, falls back to pypdf.
-    """
+    """Extract text page-wise from PDF using pdfplumber → pypdf fallback."""
     pages: List[Tuple[int, str]] = []
 
-    # Try pdfplumber first
     try:
-        import pdfplumber  # type: ignore
+        import pdfplumber
         with pdfplumber.open(path) as pdf:
             for i, page in enumerate(pdf.pages):
-                txt = page.extract_text() or ""
-                pages.append((i + 1, txt))
+                pages.append((i + 1, page.extract_text() or ""))
         if pages:
             return pages
     except Exception as e:
-        print("[PDF] pdfplumber failed → fallback to pypdf:", e)
+        print("[PDF] pdfplumber failed → pypdf fallback:", e)
 
-    # Fallback: pypdf
     try:
-        from pypdf import PdfReader  # type: ignore
+        from pypdf import PdfReader
         reader = PdfReader(path)
         for i, page in enumerate(reader.pages):
-            txt = page.extract_text() or ""
-            pages.append((i + 1, txt))
+            pages.append((i + 1, page.extract_text() or ""))
     except Exception as e:
         print("[PDF] pypdf failed:", e)
 
@@ -45,14 +39,9 @@ def extract_text_from_pdf(path: str) -> List[Tuple[int, str]]:
 
 
 def extract_text_from_docx(path: str) -> List[Tuple[int, str]]:
-    try:
-        import docx  # python-docx
-    except Exception:
-        raise RuntimeError("python-docx is required to parse .docx files")
-
+    import docx
     doc = docx.Document(path)
-    text = "\n".join(p.text for p in doc.paragraphs)
-    return [(1, text)]
+    return [(1, "\n".join(p.text for p in doc.paragraphs))]
 
 
 def extract_text_from_txt(path: str) -> List[Tuple[int, str]]:
@@ -61,10 +50,7 @@ def extract_text_from_txt(path: str) -> List[Tuple[int, str]]:
 
 
 def extract_text(path: str) -> List[Tuple[int, str]]:
-    """
-    Detect file type by extension and use appropriate parser.
-    Returns: list of (page_num, text).
-    """
+    """Auto-detect extension and extract text."""
     p = Path(path)
     ext = p.suffix.lower()
 
@@ -75,21 +61,19 @@ def extract_text(path: str) -> List[Tuple[int, str]]:
     if ext in [".txt", ".md"]:
         return extract_text_from_txt(path)
 
-    # Fallback: try pdf, then txt
+    # fallback
     try:
         return extract_text_from_pdf(path)
-    except Exception:
+    except:
         return extract_text_from_txt(path)
 
 
-# ---------------------- Section detection & chunking ----------------------
-
+# ============================================================
+#  SECTION + CHUNKING
+# ============================================================
 
 def detect_sections(page_text: str) -> List[Tuple[str, str]]:
-    """
-    Simple heuristic: detect headings & split sections.
-    Returns list of (section_title, section_text).
-    """
+    """Split text by headings."""
     lines = page_text.splitlines()
     headings = []
 
@@ -97,79 +81,104 @@ def detect_sections(page_text: str) -> List[Tuple[str, str]]:
         s = line.strip()
         if not s:
             continue
-        # Heuristic: ALL CAPS, numbered headings, or "Section"/"Chapter"
+
+        # Heading heuristics
         if s.isupper() and len(s) > 3:
             headings.append((i, s))
         elif re.match(r"^\d+[\.\)]\s+\S+", s):
             headings.append((i, s))
-        elif s.lower().startswith("section") or s.lower().startswith("chapter"):
+        elif s.lower().startswith(("section", "chapter")):
             headings.append((i, s))
 
     if not headings:
         return [("body", page_text)]
 
-    sections: List[Tuple[str, str]] = []
+    sections = []
     for idx, (line_idx, title) in enumerate(headings):
         start = line_idx
         end = headings[idx + 1][0] if idx + 1 < len(headings) else len(lines)
         sec_text = "\n".join(lines[start:end]).strip()
         sections.append((title, sec_text))
+
     return sections
 
 
 def chunk_text(text: str, chunk_chars: int = 1500, overlap_chars: int = 200) -> List[str]:
-    """
-    Char-based chunking with overlap. Good enough for many use cases.
-    """
+    """Chunk text with overlap."""
     clean = re.sub(r"\s+", " ", text).strip()
-    if not clean:
-        return []
     if len(clean) <= chunk_chars:
-        return [clean]
+        return [clean] if clean else []
 
-    chunks: List[str] = []
+    chunks = []
     start = 0
     while start < len(clean):
         end = start + chunk_chars
-        chunks.append(clean[start:end].strip())
+        chunks.append(clean[start:end])
         if end >= len(clean):
             break
         start = end - overlap_chars
     return chunks
 
 
-# ---------------------- Main indexing function ----------------------
+# ============================================================
+#  CLEAN DOMAIN DETECTION
+# ============================================================
 
+def normalize_domain(raw: str) -> str:
+    """
+    Clean and normalize domain names.
+    Converts fallback messages into 'general'.
+    """
+    if not raw:
+        return "general"
+
+    r = raw.strip().lower()
+
+    # bad / fallback domains
+    bad_patterns = [
+        "i don't know",
+        "i_don’t_know",
+        "i_dont_know",
+        "please_rephrase",
+        "available_documentation",
+    ]
+
+    if any(bad in r for bad in bad_patterns):
+        return "general"
+
+    # only allow alphabets, numbers, hyphens
+    r = re.sub(r"[^a-z0-9\- ]+", "", r)
+    r = r.replace(" ", "_").strip("_")
+
+    if not r:
+        return "general"
+
+    return r[:50]   # prevent overly long labels
+
+
+# ============================================================
+#  MAIN INDEX FUNCTION
+# ============================================================
 
 def index_document(
     file_path: str,
     user_id: Optional[int] = None,
     original_name: Optional[str] = None,
 ) -> Dict[str, Any]:
-    """
-    High level:
-    - Extract text pages from file
-    - Use LLM to detect free-text domain (no fixed list)
-    - Detect sections per page
-    - Chunk sections
-    - Embed chunks (HF Inference)
-    - Upsert to Pinecone with metadata
 
-    Returns:
-    {
-      "document_id": str,
-      "chunks_indexed": int,
-      "domain": str
-    }
-    """
     pages = extract_text(file_path)
     if not pages:
         return {"document_id": None, "chunks_indexed": 0, "domain": "general"}
 
     full_text = "\n".join(t for _, t in pages)
-    domain_label = detect_domain_llm(full_text)
 
-    # Persist UploadedDocument
+    # ------------------------------
+    # DOMAIN FIX APPLIED HERE
+    # ------------------------------
+    raw_domain = detect_domain_llm(full_text)
+    domain_label = normalize_domain(raw_domain)
+
+    # Save document
     doc = UploadedDocument.objects.create(
         user_id=user_id,
         title=original_name or Path(file_path).name,
@@ -177,18 +186,21 @@ def index_document(
         domain=domain_label,
     )
 
-    vectors_to_upsert: List[Dict[str, Any]] = []
+    vectors_to_upsert = []
 
+    # process each page → section → chunk
     for page_num, page_text in pages:
         sections = detect_sections(page_text)
+
         for sidx, (sec_title, sec_text) in enumerate(sections):
             chunks = chunk_text(sec_text)
+
             for cidx, ctext in enumerate(chunks):
                 chunk_uuid = str(uuid.uuid4())
                 snippet = ctext[:400]
 
                 metadata = {
-                    "user_id": str(user_id) if user_id is not None else None,
+                    "user_id": str(user_id),
                     "document_id": str(doc.id),
                     "domain": domain_label,
                     "page_num": page_num,
@@ -197,15 +209,11 @@ def index_document(
                     "chunk_idx": cidx,
                     "original_name": original_name or Path(file_path).name,
                     "snippet": snippet,
-                    "chunk_text": ctext,  # full chunk for retrieval context
+                    "chunk_text": ctext,
                 }
 
                 vectors_to_upsert.append(
-                    {
-                        "id": chunk_uuid,
-                        "text": ctext,
-                        "metadata": metadata,
-                    }
+                    {"id": chunk_uuid, "text": ctext, "metadata": metadata}
                 )
 
                 DocumentChunk.objects.create(
@@ -219,21 +227,14 @@ def index_document(
                     pinecone_id=chunk_uuid,
                 )
 
-    if not vectors_to_upsert:
-        return {"document_id": str(doc.id), "chunks_indexed": 0, "domain": domain_label}
-
+    # embed + upsert
     texts = [v["text"] for v in vectors_to_upsert]
     embeddings = embed_texts(texts)
 
-    upsert_items = []
-    for item, emb in zip(vectors_to_upsert, embeddings):
-        upsert_items.append(
-            {
-                "id": item["id"],
-                "values": emb,
-                "metadata": item["metadata"],
-            }
-        )
+    upsert_items = [
+        {"id": item["id"], "values": emb, "metadata": item["metadata"]}
+        for item, emb in zip(vectors_to_upsert, embeddings)
+    ]
 
     upsert_vectors(upsert_items)
 
