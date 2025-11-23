@@ -14,19 +14,15 @@ def run_rag(
     query: str,
     user_id: Optional[int] = None,
     domain: Optional[str] = None,
-    document_id: Optional[str] = None,   # <<< NEW
+    document_id: Optional[str] = None,   # NEW
     max_chunks: int = 4,
 ) -> Dict[str, Any]:
-    """
-    Main RAG pipeline.
-    """
 
-    # 1) Retrieval (hybrid, domain + OPTIONAL document)
-    candidates: List[Dict[str, Any]] = retrieve(
+    candidates = retrieve(
         query=query,
         user_id=user_id,
         domain=domain,
-        document_id=document_id,   # <<< PASS IT HERE
+        document_id=document_id,   # NEW
         top_k=max_chunks * 2,
     )
 
