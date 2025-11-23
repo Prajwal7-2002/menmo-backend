@@ -146,13 +146,35 @@ def retrieve(
     feedback_map = {fb.pinecone_id: fb for fb in feedback_qs}
 
     for m, sparse in zip(dense_matches, bm25_scores):
-        dense_score = float(m["score"])
-        sparse_score = float(sparse) / max_bm25
 
+        dense_score = float(m["score"])
+
+        # --- FIX 1: handle NaN sparse scores ---
+        try:
+            sparse_val = float(sparse)
+            if sparse_val != sparse_val:   # self-inequality = NaN check
+                sparse_val = 0.0
+        except:
+            sparse_val = 0.0
+
+        # --- FIX 2: avoid divide-by-zero in normalization ---
+        if not max_bm25 or max_bm25 == 0 or max_bm25 != max_bm25:
+            max_bm25_safe = 1.0
+        else:
+            max_bm25_safe = max_bm25
+
+        sparse_score = sparse_val / max_bm25_safe
+
+        # feedback score
         fb = feedback_map.get(m["id"])
         fb_score = fb.score if fb else 0.0
 
+        # hybrid final score
         hybrid = 0.5 * dense_score + 0.5 * sparse_score + 0.05 * fb_score
+
+        # --- FIX 3: if hybrid becomes NaN, force to 0 ---
+        if hybrid != hybrid:
+            hybrid = 0.0
 
         combined.append({
             "id": m["id"],
@@ -163,6 +185,7 @@ def retrieve(
             "bm25_score": sparse_score,
             "feedback_score": fb_score,
         })
+
 
     combined.sort(key=lambda x: x["score"], reverse=True)
     return combined[:top_k]
