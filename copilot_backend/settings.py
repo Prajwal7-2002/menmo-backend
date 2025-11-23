@@ -154,4 +154,9 @@ STATIC_ROOT = os.path.join(BASE_DIR, "static")
 # -----------------------------
 CORS_ALLOW_ALL_ORIGINS = True
 
+CORS_ALLOWED_ORIGINS = [
+  "https://your-netlify-site.netlify.app"
+]
+
+
 DEFAULT_AUTO_FIELD = 'django.db.models.BigAutoField'

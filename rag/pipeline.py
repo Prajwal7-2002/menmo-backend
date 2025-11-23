@@ -4,10 +4,10 @@ from .retrieval import retrieve, MIN_SCORE_THRESHOLD
 from .llm import call_llm_answer
 
 
-REPHRASE_MSG = (
-    "I don't know based on the available documentation. "
-    "Please rephrase your question or ask something more specific."
-)
+# REPHRASE_MSG = (
+#     "I don't know based on the available documentation. "
+#     "Please rephrase your question or ask something more specific."
+# )
 
 
 def run_rag(
