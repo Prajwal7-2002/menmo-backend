@@ -2,15 +2,17 @@
 import os
 import uuid
 import tempfile
+from pathlib import Path
 
-from rag.memory import load_buffer, prune_buffer, load_summary, save_summary, summarize_history, load_user_preferences
+from rag.memory import (
+    load_buffer, prune_buffer, load_summary,
+    save_summary, summarize_history, load_user_preferences
+)
 from api_app.models import UserPreference, ConversationSummary
-
 
 from rest_framework.views import APIView
 from rest_framework.response import Response
 from rest_framework.permissions import IsAuthenticated
-from rest_framework import status
 
 from django.db.models import Avg, Count
 from django.utils import timezone
@@ -21,11 +23,12 @@ from rag.models import UploadedDocument, ChunkFeedback, DocumentChunk
 
 from rag.pipeline import run_rag
 from rag.loader import index_document
-
 from rag.agent import build_agent
 
 
-
+# ---------------------------------------------------------
+# ASK API
+# ---------------------------------------------------------
 class AskAPIView(APIView):
     permission_classes = [IsAuthenticated]
 
@@ -35,37 +38,29 @@ class AskAPIView(APIView):
 
         query = serializer.validated_data["query"]
 
-        # Read incoming mood + history
-        req_mood = request.data.get("mood", None)
+        req_mood = request.data.get("mood")
         provided_history = request.data.get("history", []) or []
 
-        # Load user preference memory
         prefs = load_user_preferences(request.user)
         default_mood = prefs.get("default_mood", "neutral")
         mood = req_mood or default_mood
 
-        # Load short-term memory buffer + summary memory
         buffer = load_buffer(request.user)
         summary = load_summary(request.user)
 
-        # Build hybrid memory
+        # Build final memory
         final_history = []
-
         if summary:
             final_history.append({"role": "system", "content": f"Summary: {summary}"})
-
         if buffer:
             final_history.extend(buffer)
-
         if provided_history:
             final_history.extend(provided_history)
-
         final_history = prune_buffer(final_history)
 
-        active_domain = request.session.get("active_domain", None)
+        active_domain = request.session.get("active_domain")
         document_id = request.data.get("document_id")
 
-        # Run RAG using memory + preferences
         result = run_rag(
             query=query,
             user_id=request.user.id,
@@ -75,7 +70,6 @@ class AskAPIView(APIView):
             history=final_history,
         )
 
-        # Save conversation turn
         top_score = result["chunks"][0]["score"] if result.get("chunks") else 0.0
 
         QueryLog.objects.create(
@@ -87,19 +81,12 @@ class AskAPIView(APIView):
             chunks=result.get("chunks", []),
         )
 
-        # If conversation too long → summarize & save summary
-        try:
-            combined_turns = (buffer or []) + (provided_history or [])
-            if len(combined_turns) >= SUMMARY_THRESHOLD_MESSAGES:
-                summary_text = summarize_history(combined_turns)
-                if summary_text:
-                    save_summary(request.user, summary_text)
-        except:
-            pass
-
         return Response({"query_id": str(uuid.uuid4()), **result})
 
 
+# ---------------------------------------------------------
+# FEEDBACK API
+# ---------------------------------------------------------
 class FeedbackAPIView(APIView):
     permission_classes = [IsAuthenticated]
 
@@ -111,17 +98,17 @@ class FeedbackAPIView(APIView):
         qlog = fb.query_log
         chunks = qlog.chunks or []
 
-        # Apply feedback to each Pinecone chunk
         for ch in chunks:
-            if not isinstance(ch, dict):
-                continue
-            pinecone_id = ch.get("id")
-            if pinecone_id:
-                ChunkFeedback.apply_feedback(pinecone_id, fb.value)
+            pine_id = ch.get("id")
+            if pine_id:
+                ChunkFeedback.apply_feedback(pine_id, fb.value)
 
         return Response({"detail": "feedback saved", "id": str(fb.id)}, status=201)
 
 
+# ---------------------------------------------------------
+# ANALYTICS
+# ---------------------------------------------------------
 class AnalyticsAPIView(APIView):
     permission_classes = [IsAuthenticated]
 
@@ -153,6 +140,9 @@ class AnalyticsAPIView(APIView):
         })
 
 
+# ---------------------------------------------------------
+# UPLOAD DOCUMENT
+# ---------------------------------------------------------
 class UploadDocumentAPIView(APIView):
     permission_classes = [IsAuthenticated]
 
@@ -161,10 +151,15 @@ class UploadDocumentAPIView(APIView):
         if not file_obj:
             return Response({"detail": "No file uploaded"}, status=400)
 
-        with tempfile.NamedTemporaryFile(delete=False) as tmp:
+        # Save file to temp path
+        suffix = Path(file_obj.name).suffix
+        with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as tmp:
             for chunk in file_obj.chunks():
                 tmp.write(chunk)
             tmp_path = tmp.name
+
+        print("📁 Uploaded:", file_obj.name)
+        print("📁 Saved to temp:", tmp_path)
 
         info = index_document(
             file_path=tmp_path,
@@ -172,33 +167,37 @@ class UploadDocumentAPIView(APIView):
             original_name=file_obj.name,
         )
 
+        print("📝 index_document() returned:", info)
+
         return Response(info, status=201)
 
 
+# ---------------------------------------------------------
+# LIST DOCUMENTS
+# ---------------------------------------------------------
 class DocumentListAPIView(APIView):
     permission_classes = [IsAuthenticated]
 
     def get(self, request):
         docs = UploadedDocument.objects.filter(user=request.user).order_by("domain", "-created_at")
 
-        result = {}
+        grouped = {}
         for doc in docs:
-            domain = (doc.domain or "general").lower()
-
-            if domain not in result:
-                result[domain] = []
-
-            result[domain].append({
+            dom = (doc.domain or "general").lower()
+            grouped.setdefault(dom, []).append({
                 "id": str(doc.id),
                 "title": doc.title,
                 "filename": doc.original_filename,
-                "domain": domain,
+                "domain": dom,
                 "created_at": doc.created_at,
             })
 
-        return Response(result, status=200)
+        return Response(grouped, status=200)
 
 
+# ---------------------------------------------------------
+# DELETE DOCUMENT
+# ---------------------------------------------------------
 class DocumentDeleteAPIView(APIView):
     permission_classes = [IsAuthenticated]
 
@@ -208,7 +207,6 @@ class DocumentDeleteAPIView(APIView):
         except UploadedDocument.DoesNotExist:
             return Response({"detail": "Document not found"}, status=404)
 
-        # delete Pinecone vectors
         chunk_ids = list(
             DocumentChunk.objects.filter(document=doc)
             .values_list("pinecone_id", flat=True)
@@ -219,11 +217,15 @@ class DocumentDeleteAPIView(APIView):
             pc = Pinecone(api_key=os.getenv("PINECONE_API_KEY"))
             index = pc.Index(os.getenv("PINECONE_INDEX_NAME"))
             index.delete(ids=chunk_ids)
+            print("🗑 Deleted Pinecone vectors:", len(chunk_ids))
 
         doc.delete()
         return Response({"detail": "Document deleted"}, status=200)
 
 
+# ---------------------------------------------------------
+# SWITCH DOMAIN
+# ---------------------------------------------------------
 class SwitchDomainAPIView(APIView):
     permission_classes = [IsAuthenticated]
 
@@ -234,22 +236,22 @@ class SwitchDomainAPIView(APIView):
 
         request.session["active_domain"] = domain
         request.session.save()
-
         return Response({"detail": f"Active domain switched to {domain}"})
-    
 
 
+# ---------------------------------------------------------
+# AGENT ASK
+# ---------------------------------------------------------
 class AgentAskAPIView(APIView):
     permission_classes = [IsAuthenticated]
 
     def post(self, request):
         query = request.data.get("query")
-        req_mood = request.data.get("mood", None)
+        req_mood = request.data.get("mood")
         provided_history = request.data.get("history", []) or []
 
         prefs = load_user_preferences(request.user)
-        default_mood = prefs.get("default_mood", "neutral")
-        mood = req_mood or default_mood
+        mood = req_mood or prefs.get("default_mood", "neutral")
 
         buffer = load_buffer(request.user)
         summary = load_summary(request.user)
@@ -261,16 +263,12 @@ class AgentAskAPIView(APIView):
             final_history.extend(buffer)
         if provided_history:
             final_history.extend(provided_history)
-
         final_history = prune_buffer(final_history)
-
-        active_domain = request.session.get("active_domain")
-        document_id = request.data.get("document_id")
 
         agent = build_agent(
             user_id=request.user.id,
-            domain=active_domain,
-            document_id=document_id,
+            domain=request.session.get("active_domain"),
+            document_id=request.data.get("document_id"),
             mood=mood,
             history=final_history,
         )
@@ -289,18 +287,4 @@ class AgentAskAPIView(APIView):
             chunks=[],
         )
 
-        try:
-            all_turns = (buffer or []) + (provided_history or [])
-            if len(all_turns) >= SUMMARY_THRESHOLD_MESSAGES:
-                summary_text = summarize_history(all_turns)
-                if summary_text:
-                    save_summary(request.user, summary_text)
-        except:
-            pass
-
-        return Response({
-            "answer": answer,
-            "validated": True,
-            "chunks": [],
-            "agent_mode": True
-        })
+        return Response({"answer": answer, "validated": True, "chunks": [], "agent_mode": True})

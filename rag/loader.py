@@ -9,39 +9,69 @@ from .llm import detect_domain_llm
 from .models import UploadedDocument, DocumentChunk
 
 
-# ============================================================
-#  TEXT EXTRACTION HELPERS
-# ============================================================
-
+# ---------------------------------------------------------
+# PDF TEXT EXTRACTION (with OCR fallback)
+# ---------------------------------------------------------
 def extract_text_from_pdf(path: str) -> List[Tuple[int, str]]:
-    """Extract text page-wise from PDF using pdfplumber → pypdf fallback."""
     pages: List[Tuple[int, str]] = []
 
+    # -------- 1) pdfplumber --------
     try:
         import pdfplumber
         with pdfplumber.open(path) as pdf:
             for i, page in enumerate(pdf.pages):
-                pages.append((i + 1, page.extract_text() or ""))
-        if pages:
+                txt = page.extract_text() or ""
+                pages.append((i + 1, txt))
+        if any(p[1].strip() for p in pages):
+            print("[PDF] Extracted via pdfplumber")
             return pages
     except Exception as e:
-        print("[PDF] pdfplumber failed → pypdf fallback:", e)
+        print("[PDF] pdfplumber failed:", e)
+        pages = []
 
+    # -------- 2) PyPDF fallback --------
     try:
         from pypdf import PdfReader
         reader = PdfReader(path)
+        pages = []
         for i, page in enumerate(reader.pages):
-            pages.append((i + 1, page.extract_text() or ""))
+            try:
+                txt = page.extract_text() or ""
+            except:
+                txt = ""
+            pages.append((i + 1, txt))
+
+        if any(p[1].strip() for p in pages):
+            print("[PDF] Extracted via pypdf")
+            return pages
     except Exception as e:
         print("[PDF] pypdf failed:", e)
+        pages = []
 
-    return pages
+    # -------- 3) OCR fallback --------
+    try:
+        from pdf2image import convert_from_path
+        import pytesseract
+
+        print("[PDF] OCR fallback enabled")
+        images = convert_from_path(path, dpi=300)
+
+        pages = []
+        for i, img in enumerate(images):
+            txt = pytesseract.image_to_string(img)
+            pages.append((i + 1, txt))
+
+        return pages
+    except Exception as e:
+        print("[PDF] OCR failed:", e)
+
+    return []
 
 
 def extract_text_from_docx(path: str) -> List[Tuple[int, str]]:
     import docx
     doc = docx.Document(path)
-    return [(1, "\n".join(p.text for p in doc.paragraphs))]
+    return [(1, "\n".join([p.text for p in doc.paragraphs]))]
 
 
 def extract_text_from_txt(path: str) -> List[Tuple[int, str]]:
@@ -50,8 +80,7 @@ def extract_text_from_txt(path: str) -> List[Tuple[int, str]]:
 
 
 def extract_text(path: str) -> List[Tuple[int, str]]:
-    p = Path(path)
-    ext = p.suffix.lower()
+    ext = Path(path).suffix.lower()
 
     if ext == ".pdf":
         return extract_text_from_pdf(path)
@@ -60,17 +89,14 @@ def extract_text(path: str) -> List[Tuple[int, str]]:
     if ext in [".txt", ".md"]:
         return extract_text_from_txt(path)
 
-    try:
-        return extract_text_from_pdf(path)
-    except:
-        return extract_text_from_txt(path)
+    # default fallback
+    return extract_text_from_pdf(path)
 
 
-# ============================================================
-#  SECTION + CHUNKING
-# ============================================================
-
-def detect_sections(page_text: str) -> List[Tuple[str, str]]:
+# ---------------------------------------------------------
+# SECTION DETECTION
+# ---------------------------------------------------------
+def detect_sections(page_text: str):
     lines = page_text.splitlines()
     headings = []
 
@@ -78,7 +104,6 @@ def detect_sections(page_text: str) -> List[Tuple[str, str]]:
         s = line.strip()
         if not s:
             continue
-
         if s.isupper() and len(s) > 3:
             headings.append((i, s))
         elif re.match(r"^\d+[\.\)]\s+\S+", s):
@@ -93,147 +118,127 @@ def detect_sections(page_text: str) -> List[Tuple[str, str]]:
     for idx, (line_idx, title) in enumerate(headings):
         start = line_idx
         end = headings[idx + 1][0] if idx + 1 < len(headings) else len(lines)
-        sec_text = "\n".join(lines[start:end]).strip()
-        sections.append((title, sec_text))
+        sec = "\n".join(lines[start:end]).strip()
+        sections.append((title, sec))
 
     return sections
 
 
-def chunk_text(text: str, chunk_chars: int = 1500, overlap_chars: int = 200) -> List[str]:
+# ---------------------------------------------------------
+# CHUNKING
+# ---------------------------------------------------------
+def chunk_text(text: str, size: int = 1500, overlap: int = 200):
     clean = re.sub(r"\s+", " ", text).strip()
-    if len(clean) <= chunk_chars:
-        return [clean] if clean else []
+    if not clean:
+        return []
 
-    chunks = []
+    if len(clean) <= size:
+        return [clean]
+
+    res = []
     start = 0
     while start < len(clean):
-        end = start + chunk_chars
-        chunks.append(clean[start:end])
+        end = start + size
+        res.append(clean[start:end])
         if end >= len(clean):
             break
-        start = end - overlap_chars
-    return chunks
+        start = end - overlap
+    return res
 
 
-# ============================================================
-#  FIXED DOMAIN NORMALIZATION
-# ============================================================
-
+# ---------------------------------------------------------
+# NORMALIZE DOMAIN
+# ---------------------------------------------------------
 def normalize_domain(raw: str) -> str:
-    """
-    Clean and normalize domain names.
-    Force numeric or meaningless output into 'general'.
-    """
     if not raw:
         return "general"
 
-    r = raw.strip().lower()
+    r = re.sub(r"[^a-z0-9 ]+", "", raw.lower()).strip().replace(" ", "_")
 
-    # Known bad values
-    bad_patterns = [
-        "i don't know",
-        "i_don’t_know",
-        "i_dont_know",
-        "please_rephrase",
-        "available_documentation",
-    ]
-    if any(bad in r for bad in bad_patterns):
-        return "general"
-
-    # remove special chars
-    r = re.sub(r"[^a-z0-9\- ]+", "", r)
-    r = r.replace(" ", "_").strip("_")
-
-    # BAD CASE FIX: pure numbers like "1" / "10" / "123"
-    if r.isdigit():
-        return "general"
-
-    # too short → useless
-    if len(r) < 3:
+    if r.isdigit() or len(r) < 3:
         return "general"
 
     return r[:50]
 
 
-# ============================================================
-#  MAIN INDEX FUNCTION
-# ============================================================
-
-def index_document(
-    file_path: str,
-    user_id: Optional[int] = None,
-    original_name: Optional[str] = None,
-) -> Dict[str, Any]:
+# ---------------------------------------------------------
+# MAIN INDEXING PIPELINE
+# ---------------------------------------------------------
+def index_document(file_path: str, user_id: int, original_name: str) -> Dict[str, Any]:
+    print(f"[index_document] Starting: {file_path}")
 
     pages = extract_text(file_path)
+    print(f"[index_document] Pages extracted: {len(pages)}")
+
     if not pages:
+        print("[index_document] No text extracted — aborting")
         return {"document_id": None, "chunks_indexed": 0, "domain": "general"}
 
-    full_text = "\n".join(t for _, t in pages)
+    full_text = "\n".join([p[1] for p in pages])
 
-    # ---- FIXED DOMAIN DETECTION ----
     raw_domain = detect_domain_llm(full_text)
-    domain_label = normalize_domain(raw_domain)
+    domain = normalize_domain(raw_domain)
 
     doc = UploadedDocument.objects.create(
         user_id=user_id,
-        title=original_name or Path(file_path).name,
-        original_filename=original_name or Path(file_path).name,
-        domain=domain_label,
+        title=original_name,
+        original_filename=original_name,
+        domain=domain,
     )
 
-    vectors_to_upsert = []
+    print(f"[index_document] Created Document ID {doc.id} domain={domain}")
 
+    vectors = []
     for page_num, page_text in pages:
         sections = detect_sections(page_text)
 
-        for sidx, (sec_title, sec_text) in enumerate(sections):
+        for s_idx, (title, sec_text) in enumerate(sections):
             chunks = chunk_text(sec_text)
+            for c_idx, ctext in enumerate(chunks):
+                cid = str(uuid.uuid4())
+                snippet = ctext[:300]
 
-            for cidx, ctext in enumerate(chunks):
-                chunk_uuid = str(uuid.uuid4())
-                snippet = ctext[:400]
-
-                metadata = {
-                    "user_id": str(user_id),
-                    "document_id": str(doc.id),
-                    "domain": domain_label,
-                    "page_num": page_num,
-                    "section_idx": sidx,
-                    "section_title": sec_title,
-                    "chunk_idx": cidx,
-                    "original_name": original_name or Path(file_path).name,
-                    "snippet": snippet,
-                    "chunk_text": ctext,
-                }
-
-                vectors_to_upsert.append(
-                    {"id": chunk_uuid, "text": ctext, "metadata": metadata}
-                )
+                vectors.append({
+                    "id": cid,
+                    "text": ctext,
+                    "metadata": {
+                        "user_id": str(user_id),
+                        "document_id": str(doc.id),
+                        "domain": domain,
+                        "page_num": page_num,
+                        "section_idx": s_idx,
+                        "section_title": title,
+                        "chunk_idx": c_idx,
+                        "snippet": snippet,
+                    }
+                })
 
                 DocumentChunk.objects.create(
-                    id=chunk_uuid,
+                    id=cid,
                     document=doc,
-                    chunk_idx=cidx,
-                    section_idx=sidx,
-                    section_title=sec_title,
+                    chunk_idx=c_idx,
+                    section_idx=s_idx,
+                    section_title=title,
                     page_num=page_num,
                     snippet=snippet,
-                    pinecone_id=chunk_uuid,
+                    pinecone_id=cid,
                 )
 
-    texts = [v["text"] for v in vectors_to_upsert]
-    embeddings = embed_texts(texts)
+    print(f"[index_document] Chunks generated: {len(vectors)}")
 
+    # Embed + upsert
+    texts = [v["text"] for v in vectors]
+    emb = embed_texts(texts)
     upsert_items = [
-        {"id": item["id"], "values": emb, "metadata": item["metadata"]}
-        for item, emb in zip(vectors_to_upsert, embeddings)
+        {"id": vec["id"], "values": e, "metadata": vec["metadata"]}
+        for vec, e in zip(vectors, emb)
     ]
 
+    print(f"[index_document] Upserting vectors: {len(upsert_items)}")
     upsert_vectors(upsert_items)
 
     return {
         "document_id": str(doc.id),
         "chunks_indexed": len(upsert_items),
-        "domain": domain_label,
+        "domain": domain,
     }
