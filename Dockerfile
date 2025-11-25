@@ -12,8 +12,8 @@ WORKDIR /app
 # HuggingFace Cache
 # ----------------------
 ENV HF_HOME=/app/hf-cache
-ENV TRANSFORMERS_CACHE=/app/hf-cache
 ENV HF_HUB_CACHE=/app/hf-cache
+ENV HF_HUB_ENABLE_HF_TRANSFER=0
 
 RUN mkdir -p /app/hf-cache
 
@@ -34,12 +34,15 @@ RUN apt-get update && apt-get install -y \
 # ----------------------
 COPY requirements.txt .
 
-# Install CPU-only torch FIRST to stop CUDA downloads
-RUN pip install --no-cache-dir torch==2.2.1+cpu -f https://download.pytorch.org/whl/cpu/torch_stable.html \
- && pip install --no-cache-dir -r requirements.txt
+# Install CPU-only torch FIRST (prevent CUDA downloads)
+RUN pip install --no-cache-dir --no-deps torch==2.2.1+cpu \
+    -f https://download.pytorch.org/whl/cpu/torch_stable.html
+
+# Install remaining dependencies
+RUN pip install --no-cache-dir -r requirements.txt
 
 # ----------------------
-# Project Files
+# Project files
 # ----------------------
 COPY . .
 
