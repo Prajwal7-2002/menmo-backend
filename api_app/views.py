@@ -1,6 +1,11 @@
+# api/views.py
 import os
 import uuid
 import tempfile
+
+from rag.memory import load_buffer, prune_buffer, load_summary, save_summary, summarize_history, load_user_preferences
+from api_app.models import UserPreference, ConversationSummary
+
 
 from rest_framework.views import APIView
 from rest_framework.response import Response
@@ -17,13 +22,10 @@ from rag.models import UploadedDocument, ChunkFeedback, DocumentChunk
 from rag.pipeline import run_rag
 from rag.loader import index_document
 
+from rag.agent import build_agent
 
-# ---------------------------------------
-# 🟦  ASK API
-# ---------------------------------------
-# ---------------------------------------
-# 🟦  ASK API (supports optional document)
-# ---------------------------------------
+
+
 class AskAPIView(APIView):
     permission_classes = [IsAuthenticated]
 
@@ -33,19 +35,50 @@ class AskAPIView(APIView):
 
         query = serializer.validated_data["query"]
 
-        active_domain = request.session.get("active_domain", None)
-        document_id = request.data.get("document_id")  # optional
+        # Read incoming mood + history
+        req_mood = request.data.get("mood", None)
+        provided_history = request.data.get("history", []) or []
 
+        # Load user preference memory
+        prefs = load_user_preferences(request.user)
+        default_mood = prefs.get("default_mood", "neutral")
+        mood = req_mood or default_mood
+
+        # Load short-term memory buffer + summary memory
+        buffer = load_buffer(request.user)
+        summary = load_summary(request.user)
+
+        # Build hybrid memory
+        final_history = []
+
+        if summary:
+            final_history.append({"role": "system", "content": f"Summary: {summary}"})
+
+        if buffer:
+            final_history.extend(buffer)
+
+        if provided_history:
+            final_history.extend(provided_history)
+
+        final_history = prune_buffer(final_history)
+
+        active_domain = request.session.get("active_domain", None)
+        document_id = request.data.get("document_id")
+
+        # Run RAG using memory + preferences
         result = run_rag(
-            query,
+            query=query,
             user_id=request.user.id,
             domain=active_domain,
-            document_id=document_id   # <<< NEW
+            document_id=document_id,
+            mood=mood,
+            history=final_history,
         )
 
+        # Save conversation turn
         top_score = result["chunks"][0]["score"] if result.get("chunks") else 0.0
 
-        qlog = QueryLog.objects.create(
+        QueryLog.objects.create(
             id=uuid.uuid4(),
             user=request.user,
             query=query,
@@ -54,13 +87,19 @@ class AskAPIView(APIView):
             chunks=result.get("chunks", []),
         )
 
-        return Response({"query_id": str(qlog.id), **result})
+        # If conversation too long → summarize & save summary
+        try:
+            combined_turns = (buffer or []) + (provided_history or [])
+            if len(combined_turns) >= SUMMARY_THRESHOLD_MESSAGES:
+                summary_text = summarize_history(combined_turns)
+                if summary_text:
+                    save_summary(request.user, summary_text)
+        except:
+            pass
+
+        return Response({"query_id": str(uuid.uuid4()), **result})
 
 
-
-# ---------------------------------------
-# 🟩  FEEDBACK API
-# ---------------------------------------
 class FeedbackAPIView(APIView):
     permission_classes = [IsAuthenticated]
 
@@ -83,9 +122,6 @@ class FeedbackAPIView(APIView):
         return Response({"detail": "feedback saved", "id": str(fb.id)}, status=201)
 
 
-# ---------------------------------------
-# 🟧  ANALYTICS
-# ---------------------------------------
 class AnalyticsAPIView(APIView):
     permission_classes = [IsAuthenticated]
 
@@ -117,9 +153,6 @@ class AnalyticsAPIView(APIView):
         })
 
 
-# ---------------------------------------
-# 🟪  UPLOAD DOCUMENT
-# ---------------------------------------
 class UploadDocumentAPIView(APIView):
     permission_classes = [IsAuthenticated]
 
@@ -142,9 +175,6 @@ class UploadDocumentAPIView(APIView):
         return Response(info, status=201)
 
 
-# ---------------------------------------
-# 🟨  LIST DOCUMENTS (grouped by domain)
-# ---------------------------------------
 class DocumentListAPIView(APIView):
     permission_classes = [IsAuthenticated]
 
@@ -169,9 +199,6 @@ class DocumentListAPIView(APIView):
         return Response(result, status=200)
 
 
-# ---------------------------------------
-# 🟥  DELETE DOCUMENT
-# ---------------------------------------
 class DocumentDeleteAPIView(APIView):
     permission_classes = [IsAuthenticated]
 
@@ -197,9 +224,6 @@ class DocumentDeleteAPIView(APIView):
         return Response({"detail": "Document deleted"}, status=200)
 
 
-# ---------------------------------------
-# 🟦  SWITCH ACTIVE DOMAIN
-# ---------------------------------------
 class SwitchDomainAPIView(APIView):
     permission_classes = [IsAuthenticated]
 
@@ -212,3 +236,71 @@ class SwitchDomainAPIView(APIView):
         request.session.save()
 
         return Response({"detail": f"Active domain switched to {domain}"})
+    
+
+
+class AgentAskAPIView(APIView):
+    permission_classes = [IsAuthenticated]
+
+    def post(self, request):
+        query = request.data.get("query")
+        req_mood = request.data.get("mood", None)
+        provided_history = request.data.get("history", []) or []
+
+        prefs = load_user_preferences(request.user)
+        default_mood = prefs.get("default_mood", "neutral")
+        mood = req_mood or default_mood
+
+        buffer = load_buffer(request.user)
+        summary = load_summary(request.user)
+
+        final_history = []
+        if summary:
+            final_history.append({"role": "system", "content": f"Summary: {summary}"})
+        if buffer:
+            final_history.extend(buffer)
+        if provided_history:
+            final_history.extend(provided_history)
+
+        final_history = prune_buffer(final_history)
+
+        active_domain = request.session.get("active_domain")
+        document_id = request.data.get("document_id")
+
+        agent = build_agent(
+            user_id=request.user.id,
+            domain=active_domain,
+            document_id=document_id,
+            mood=mood,
+            history=final_history,
+        )
+
+        try:
+            answer = agent.run(query)
+        except Exception as e:
+            answer = f"Agent error: {e}"
+
+        QueryLog.objects.create(
+            id=uuid.uuid4(),
+            user=request.user,
+            query=query,
+            answer=answer[:4000],
+            top_score=1.0,
+            chunks=[],
+        )
+
+        try:
+            all_turns = (buffer or []) + (provided_history or [])
+            if len(all_turns) >= SUMMARY_THRESHOLD_MESSAGES:
+                summary_text = summarize_history(all_turns)
+                if summary_text:
+                    save_summary(request.user, summary_text)
+        except:
+            pass
+
+        return Response({
+            "answer": answer,
+            "validated": True,
+            "chunks": [],
+            "agent_mode": True
+        })

@@ -7,6 +7,7 @@ from .views import (
     DocumentListAPIView,
     DocumentDeleteAPIView,
     SwitchDomainAPIView,
+    AgentAskAPIView,
 )
 
 urlpatterns = [
@@ -19,4 +20,6 @@ urlpatterns = [
 
     path("delete-document/<uuid:doc_id>/", DocumentDeleteAPIView.as_view(), name="delete_document"),
     path("switch-domain/", SwitchDomainAPIView.as_view(), name="switch_domain"),
+    path("ask-agent/", AgentAskAPIView.as_view()),
+
 ]

@@ -3,10 +3,12 @@
 import os
 from typing import List, Dict, Any, Optional
 
-from sentence_transformers import SentenceTransformer
+from sentence_transformers import SentenceTransformer, CrossEncoder
 from pinecone import Pinecone
 from rank_bm25 import BM25Okapi
+
 from .models import ChunkFeedback
+from .llm import call_llm_answer   # <-- for query rewriting
 
 # ---------------------- Config ----------------------
 
@@ -19,6 +21,9 @@ MIN_SCORE_THRESHOLD = float(os.getenv("RAG_MIN_SCORE_THRESHOLD", "0.35"))
 TOP_K_DEFAULT = 8
 
 _model: SentenceTransformer | None = None
+
+# NEW: Cross-Encoder ReRanker (lightweight & fast)
+_reranker: CrossEncoder | None = None
 
 
 # ---------------------- Helpers ----------------------
@@ -35,6 +40,13 @@ def _get_model() -> SentenceTransformer:
     if _model is None:
         _model = SentenceTransformer(EMBED_MODEL_NAME)
     return _model
+
+
+def _get_reranker() -> CrossEncoder:
+    global _reranker
+    if _reranker is None:
+        _reranker = CrossEncoder("cross-encoder/ms-marco-MiniLM-L6-v2")
+    return _reranker
 
 
 # ---------------------- Embeddings ----------------------
@@ -57,7 +69,7 @@ def upsert_vectors(items: List[Dict[str, Any]], batch_size: int = 100) -> None:
         index.upsert(vectors=items[i:i + batch_size])
 
 
-# ---------------------- Pinecone Query ----------------------
+# ---------------------- Query Vectors ----------------------
 
 def query_vectors(
     query_text: str,
@@ -77,7 +89,7 @@ def query_vectors(
     if domain:
         flt["domain"] = domain
     if document_id:
-        flt["document_id"] = document_id   # NEW
+        flt["document_id"] = document_id
 
     res = index.query(
         vector=q_vec,
@@ -100,29 +112,49 @@ def query_vectors(
     return matches
 
 
-# ---------------------- Hybrid Retrieval ----------------------
+# ---------------------- Hybrid Retrieval (Upgraded) ----------------------
 
 def retrieve(
     query: str,
     user_id: Optional[int] = None,
     domain: Optional[str] = None,
-    document_id: Optional[str] = None,   # NEW
+    document_id: Optional[str] = None,
     top_k: int = TOP_K_DEFAULT,
 ) -> List[Dict[str, Any]]:
 
-    # 1. Dense retrieval (with document filter)
+    # ========================
+    # 🔥 1. Query Rewriting
+    # ========================
+    try:
+        rewritten = call_llm_answer(
+            question=f"Rewrite this query to improve document search accuracy: {query}",
+            context="",
+            mood="serious",
+            max_tokens=48
+        )
+
+        if rewritten and len(rewritten) < 200:
+            effective_query = rewritten
+        else:
+            effective_query = query
+    except Exception:
+        effective_query = query
+
+    # ========================
+    # 🔥 2. Dense retrieval
+    # ========================
     dense_matches = query_vectors(
-        query_text=query,
+        query_text=effective_query,
         user_id=user_id,
         domain=domain,
-        document_id=document_id,   # NEW
+        document_id=document_id,
         top_k=max(top_k * 2, 10),
     )
 
     if not dense_matches:
         return []
 
-    # Domain locking
+    # Domain auto-lock
     if domain is None:
         domains = [m["meta"].get("domain") for m in dense_matches]
         if domains:
@@ -133,46 +165,59 @@ def retrieve(
     if not dense_matches:
         return []
 
-    # 2. BM25 sparse scoring
+    # ========================
+    # 🔥 3. BM25 Sparse Scoring
+    # ========================
     corpus_tokens = [m["text"].split() for m in dense_matches]
     bm25 = BM25Okapi(corpus_tokens)
-    bm25_scores = bm25.get_scores(query.split())
-    max_bm25 = max(bm25_scores) if len(bm25_scores) > 0 else 1.0
+    bm25_scores = bm25.get_scores(effective_query.split())
 
-    # 3. Combine dense + sparse + feedback
-    combined = []
+    max_bm25 = max(bm25_scores) if len(bm25_scores) else 1.0
+
+    # ========================
+    # 🔥 4. Feedback lookup
+    # ========================
     pinecone_ids = [m["id"] for m in dense_matches]
     feedback_qs = ChunkFeedback.objects.filter(pinecone_id__in=pinecone_ids)
     feedback_map = {fb.pinecone_id: fb for fb in feedback_qs}
 
-    for m, sparse in zip(dense_matches, bm25_scores):
+    # ========================
+    # 🔥 5. Cross-Encoder Reranking
+    # ========================
+    reranker = _get_reranker()
+    passage_pairs = [(effective_query, m["text"]) for m in dense_matches]
+    rerank_scores = reranker.predict(passage_pairs)
+
+    # ========================
+    # 🔥 6. Hybrid Score (IMPROVED)
+    # ========================
+    combined = []
+    for m, sparse, rerank in zip(dense_matches, bm25_scores, rerank_scores):
 
         dense_score = float(m["score"])
 
-        # --- FIX 1: handle NaN sparse scores ---
+        # Safe normalize sparse
         try:
             sparse_val = float(sparse)
-            if sparse_val != sparse_val:   # self-inequality = NaN check
+            if sparse_val != sparse_val:  # NaN check
                 sparse_val = 0.0
         except:
             sparse_val = 0.0
 
-        # --- FIX 2: avoid divide-by-zero in normalization ---
-        if not max_bm25 or max_bm25 == 0 or max_bm25 != max_bm25:
-            max_bm25_safe = 1.0
-        else:
-            max_bm25_safe = max_bm25
+        sparse_score = sparse_val / (max_bm25 or 1.0)
 
-        sparse_score = sparse_val / max_bm25_safe
-
-        # feedback score
         fb = feedback_map.get(m["id"])
         fb_score = fb.score if fb else 0.0
 
-        # hybrid final score
-        hybrid = 0.5 * dense_score + 0.5 * sparse_score + 0.05 * fb_score
+        # NEW hybrid score (best practice)
+        hybrid = (
+            0.40 * dense_score +
+            0.35 * sparse_score +
+            0.20 * float(rerank) +
+            0.05 * fb_score
+        )
 
-        # --- FIX 3: if hybrid becomes NaN, force to 0 ---
+        # NaN guard
         if hybrid != hybrid:
             hybrid = 0.0
 
@@ -183,9 +228,10 @@ def retrieve(
             "score": hybrid,
             "dense_score": dense_score,
             "bm25_score": sparse_score,
+            "rerank_score": float(rerank),
             "feedback_score": fb_score,
         })
 
-
     combined.sort(key=lambda x: x["score"], reverse=True)
+
     return combined[:top_k]

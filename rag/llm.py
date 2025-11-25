@@ -24,17 +24,39 @@ CONTEXT:
 USER QUESTION:
 {question}
 
+STYLE INSTRUCTIONS:
+Respond in the following style/mood: {mood}.
+If mood = neutral, respond in a factual tone.
+
 GROUND-TRUTH ANSWER:
 """
 
 
-def call_llm_answer(question: str, context: str, max_tokens: int = 256, temperature: float = 0.0):
+def call_llm_answer(
+    question: str,
+    context: str,
+    mood: str = "neutral",
+    max_tokens: int = 256,
+    temperature: float = 0.0,
+):
     """
     Uses Groq to generate an answer grounded in the context.
+    mood: "neutral" | "serious" | "joke" | "emotional" | "friendly"
     Returns answer string or None if any error.
     """
     if not GROQ_API_KEY:
         return None
+
+    # Map mood to temperature (override incoming temperature for consistent styles)
+    mood_map = {
+        "neutral": 0.3,
+        "serious": 0.1,
+        "joke": 0.9,
+        "emotional": 0.7,
+        "friendly": 0.6,
+    }
+    # If user passes an unknown mood, fallback to neutral
+    temperature = mood_map.get(mood, mood_map["neutral"])
 
     headers = {
         "Authorization": f"Bearer {GROQ_API_KEY}",
@@ -46,7 +68,7 @@ def call_llm_answer(question: str, context: str, max_tokens: int = 256, temperat
             {"role": "system", "content": "You MUST answer only using the given context."},
             {
                 "role": "user",
-                "content": ANSWER_PROMPT.format(context=context, question=question),
+                "content": ANSWER_PROMPT.format(context=context, question=question, mood=mood),
             },
         ],
         "max_tokens": max_tokens,
@@ -65,7 +87,8 @@ def call_llm_answer(question: str, context: str, max_tokens: int = 256, temperat
 
 # Backwards-compat for old imports: call_llm(...)
 def call_llm(question: str, context: str, max_tokens: int = 256):
-    return call_llm_answer(question, context, max_tokens=max_tokens, temperature=0.0)
+    # keep behaviour stable: neutral mood, deterministic temperature 0.0 for compatibility
+    return call_llm_answer(question, context, mood="neutral", max_tokens=max_tokens, temperature=0.0)
 
 
 # ---------------------- Domain detection prompt ----------------------
@@ -86,6 +109,7 @@ DOCUMENT:
 
 DOMAIN:
 """
+
 
 def detect_domain_llm(text: str) -> str:
     """

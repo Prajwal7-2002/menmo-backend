@@ -30,3 +30,23 @@ class Feedback(models.Model):
 
     class Meta:
         ordering = ["-created_at"]
+
+
+class UserPreference(models.Model):
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    user = models.ForeignKey(UserModel, on_delete=models.CASCADE)
+    key = models.CharField(max_length=100)
+    value = models.TextField()
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        unique_together = ("user", "key")
+
+
+class ConversationSummary(models.Model):
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    user = models.ForeignKey(UserModel, on_delete=models.CASCADE)
+    summary = models.TextField()
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
