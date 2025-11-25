@@ -238,10 +238,27 @@ def retrieve(
     try:
         reranker = _get_reranker()
         passage_pairs = [(effective_query, m["text"]) for m in dense_matches]
-        rerank_scores = reranker.predict(passage_pairs)
+        rerank_scores_raw = reranker.predict(passage_pairs)
+        # convert to float list
+        rerank_scores = [float(x) for x in rerank_scores_raw]
     except Exception as e:
         logger.exception("Reranker failed: %s", e)
         rerank_scores = [0.0] * len(dense_matches)
+
+    # Ensure lengths align
+    if len(rerank_scores) != len(dense_matches):
+        logger.warning("Reranker returned %d scores but there are %d dense matches; adjusting.", len(rerank_scores), len(dense_matches))
+        # fallback to neutral scores
+        rerank_scores = [0.0] * len(dense_matches)
+
+    # normalize reranker to 0..1 (per-query min-max)
+    try:
+        rmin = min(rerank_scores)
+        rmax = max(rerank_scores)
+        rspan = max(1e-6, (rmax - rmin))
+        rerank_norm = [(r - rmin) / rspan for r in rerank_scores]
+    except Exception:
+        rerank_norm = [0.5] * len(rerank_scores)  # neutral fallback
 
     # ========================
     # 6) Hybrid Score (IMPROVED + normalized)
@@ -254,7 +271,7 @@ def retrieve(
     span_dense = max(1e-6, (max_dense - min_dense))
 
     combined = []
-    for m, sparse, rerank in zip(dense_matches, bm25_scores, rerank_scores):
+    for idx, (m, sparse, rerank_val) in enumerate(zip(dense_matches, bm25_scores, rerank_norm)):
         raw_ds = float(m["score"])
         # normalized dense in 0..1
         dense_score_norm = (raw_ds - min_dense) / span_dense if span_dense else 0.0
@@ -271,12 +288,13 @@ def retrieve(
         fb = feedback_map.get(m["id"])
         fb_score = float(fb.score) if fb else 0.0
 
-        # Weighted hybrid (weights chosen to be resilient)
+        # Weighted hybrid (use normalized rerank)
+        # Note: rerank_norm is 0..1 so weight chosen lower to not overpower dense/bm25
         hybrid = (
             0.45 * dense_score_norm +
             0.30 * sparse_score +
-            0.20 * float(rerank) +
-            0.05 * fb_score
+            0.15 * rerank_val +   # normalized reranker contribution
+            0.10 * fb_score
         )
 
         # NaN guard
@@ -291,7 +309,8 @@ def retrieve(
             "dense_score_raw": raw_ds,
             "dense_score_norm": dense_score_norm,
             "bm25_score": sparse_score,
-            "rerank_score": float(rerank),
+            "rerank_score": float(rerank_scores[idx]) if idx < len(rerank_scores) else 0.0,
+            "rerank_norm": rerank_val,
             "feedback_score": fb_score,
         })
 
