@@ -11,23 +11,29 @@ echo "HF_HOME=$HF_HOME"
 echo "HF_EMBED_MODEL=$HF_EMBED_MODEL"
 echo "==========================================================="
 
-# Test DB connectivity if env provided (best-effort)
+# Test DB connectivity (optional but useful)
 if [ -n "$DB_HOST" ] && [ -n "$DB_NAME" ]; then
   echo "Trying DB connection..."
-  PGPASSWORD="$DB_PASSWORD" psql \
-    --host="$DB_HOST" \
-    --username="$DB_USER" \
-    --dbname="$DB_NAME" \
-    -c "SELECT 1;" || echo "❌ MANUAL DB CONNECT FAILED INSIDE CONTAINER"
+  if command -v psql >/dev/null; then
+    PGPASSWORD="$DB_PASSWORD" psql \
+      --host="$DB_HOST" \
+      --username="$DB_USER" \
+      --dbname="$DB_NAME" \
+      -c "SELECT NOW();" || echo "❌ MANUAL DB CONNECT FAILED INSIDE CONTAINER"
+  else
+    echo "⚠️ psql not installed (skipping manual DB test)"
+  fi
 fi
 
-# Run migrations and collectstatic
+echo "Applying migrations..."
 python manage.py migrate --noinput
+
+echo "Collecting static files..."
 python manage.py collectstatic --noinput || true
 
 echo "Starting Gunicorn..."
-# Use a simple worker count; tune for your Space hardware
-gunicorn backend.wsgi:application \
+gunicorn copilot_backend.wsgi:application \
+  --chdir /app \
   --bind 0.0.0.0:7860 \
   --workers ${GUNICORN_WORKERS:-2} \
   --threads ${GUNICORN_THREADS:-4} \
