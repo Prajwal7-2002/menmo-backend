@@ -1,19 +1,19 @@
 # Dockerfile
 FROM python:3.11-slim
 
-# Force IPv4 for DNS (helps some cloud environments)
 RUN echo "precedence ::ffff:0:0/96  100" >> /etc/gai.conf
 
 WORKDIR /app
 
-# --- HuggingFace persistent cache inside the image (not external storage) ---
-ENV HF_HOME=/app/.cache/huggingface
-ENV TRANSFORMERS_CACHE=/app/.cache/huggingface
-ENV HF_HUB_CACHE=/app/.cache/huggingface
+# Local persistent cache inside image
+ENV HF_HOME=/app/hf-cache
+ENV TRANSFORMERS_CACHE=/app/hf-cache
+ENV HF_HUB_CACHE=/app/hf-cache
 
-RUN mkdir -p /app/.cache/huggingface
+RUN mkdir -p /app/hf-cache
+RUN mkdir -p /app/models
 
-# Install build deps
+# Install build dependencies
 RUN apt-get update && apt-get install -y \
     gcc \
     python3-dev \
@@ -22,30 +22,33 @@ RUN apt-get update && apt-get install -y \
     && rm -rf /var/lib/apt/lists/*
 
 COPY requirements.txt .
-
-# Install Python deps (no cache to keep image small)
 RUN pip install --no-cache-dir -r requirements.txt
 
-# === Pre-download models at build time to avoid runtime download ===
-# This will bake the sentence-transformers model into the image.
-RUN python3 - <<'PY'
+# === PRE-DOWNLOAD AND SAVE MODEL INTO THE IMAGE ===
+RUN python3 - <<'EOF'
 from sentence_transformers import SentenceTransformer
-# Ensure this model matches EMBED_MODEL_NAME in retrieval.py
-SentenceTransformer("sentence-transformers/all-MiniLM-L6-v2")
-# If you want to pre-download reranker (large), uncomment:
-# from sentence_transformers import CrossEncoder
-# CrossEncoder("cross-encoder/ms-marco-MiniLM-L6-v2")
-print("✅ Pre-download complete")
-PY
+model = SentenceTransformer("sentence-transformers/all-MiniLM-L6-v2")
+model.save("/app/models/minilm")
+print("✅ MiniLM saved to /app/models/minilm")
+EOF
 
-# Copy source after installing deps + caches populated
+# If you want reranker baked in (optional, heavy):
+# RUN python3 - <<'EOF'
+# from sentence_transformers import CrossEncoder
+# model = CrossEncoder("cross-encoder/ms-marco-MiniLM-L6-v2")
+# model.save_pretrained("/app/models/reranker")
+# print("✅ Reranker saved")
+# EOF
+
+# Copy remaining source code
 COPY . .
 
-# Remove any .env inside container for safety
+# FORCE HF_EMBED_MODEL to use local path → prevents all downloads
+ENV HF_EMBED_MODEL=/app/models/minilm
+
+# Remove .env for security
 RUN find /app -name ".env" -delete || true
 
-# Expose application port (match runserver/gunicorn)
 EXPOSE 7860
 
-# Entrypoint script will start the app with gunicorn
 ENTRYPOINT ["sh", "entrypoint.sh"]

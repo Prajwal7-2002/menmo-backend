@@ -62,9 +62,17 @@ def _get_pinecone_index():
 def _get_model() -> SentenceTransformer:
     global _model
     if _model is None:
-        logger.info("Loading embedding model: %s", EMBED_MODEL_NAME)
-        # SentenceTransformer will pick up pre-baked model in the image/cache if present
-        _model = SentenceTransformer(EMBED_MODEL_NAME)
+        logger.info(f"Loading embedding model from: {EMBED_MODEL_NAME}")
+
+        # Load local model if EMBED_MODEL_NAME points to a folder
+        if EMBED_MODEL_NAME.startswith("/") or os.path.isdir(EMBED_MODEL_NAME):
+            logger.info("Detected local model folder → loading locally")
+            _model = SentenceTransformer(EMBED_MODEL_NAME)
+        else:
+            # Otherwise load from hub
+            logger.info("Loading model from HuggingFace Hub")
+            _model = SentenceTransformer(EMBED_MODEL_NAME)
+
     return _model
 
 
