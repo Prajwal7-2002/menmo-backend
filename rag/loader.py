@@ -50,7 +50,6 @@ def extract_text_from_txt(path: str) -> List[Tuple[int, str]]:
 
 
 def extract_text(path: str) -> List[Tuple[int, str]]:
-    """Auto-detect extension and extract text."""
     p = Path(path)
     ext = p.suffix.lower()
 
@@ -61,7 +60,6 @@ def extract_text(path: str) -> List[Tuple[int, str]]:
     if ext in [".txt", ".md"]:
         return extract_text_from_txt(path)
 
-    # fallback
     try:
         return extract_text_from_pdf(path)
     except:
@@ -73,7 +71,6 @@ def extract_text(path: str) -> List[Tuple[int, str]]:
 # ============================================================
 
 def detect_sections(page_text: str) -> List[Tuple[str, str]]:
-    """Split text by headings."""
     lines = page_text.splitlines()
     headings = []
 
@@ -82,7 +79,6 @@ def detect_sections(page_text: str) -> List[Tuple[str, str]]:
         if not s:
             continue
 
-        # Heading heuristics
         if s.isupper() and len(s) > 3:
             headings.append((i, s))
         elif re.match(r"^\d+[\.\)]\s+\S+", s):
@@ -104,7 +100,6 @@ def detect_sections(page_text: str) -> List[Tuple[str, str]]:
 
 
 def chunk_text(text: str, chunk_chars: int = 1500, overlap_chars: int = 200) -> List[str]:
-    """Chunk text with overlap."""
     clean = re.sub(r"\s+", " ", text).strip()
     if len(clean) <= chunk_chars:
         return [clean] if clean else []
@@ -121,20 +116,20 @@ def chunk_text(text: str, chunk_chars: int = 1500, overlap_chars: int = 200) -> 
 
 
 # ============================================================
-#  CLEAN DOMAIN DETECTION
+#  FIXED DOMAIN NORMALIZATION
 # ============================================================
 
 def normalize_domain(raw: str) -> str:
     """
     Clean and normalize domain names.
-    Converts fallback messages into 'general'.
+    Force numeric or meaningless output into 'general'.
     """
     if not raw:
         return "general"
 
     r = raw.strip().lower()
 
-    # bad / fallback domains
+    # Known bad values
     bad_patterns = [
         "i don't know",
         "i_don’t_know",
@@ -142,18 +137,22 @@ def normalize_domain(raw: str) -> str:
         "please_rephrase",
         "available_documentation",
     ]
-
     if any(bad in r for bad in bad_patterns):
         return "general"
 
-    # only allow alphabets, numbers, hyphens
+    # remove special chars
     r = re.sub(r"[^a-z0-9\- ]+", "", r)
     r = r.replace(" ", "_").strip("_")
 
-    if not r:
+    # BAD CASE FIX: pure numbers like "1" / "10" / "123"
+    if r.isdigit():
         return "general"
 
-    return r[:50]   # prevent overly long labels
+    # too short → useless
+    if len(r) < 3:
+        return "general"
+
+    return r[:50]
 
 
 # ============================================================
@@ -172,13 +171,10 @@ def index_document(
 
     full_text = "\n".join(t for _, t in pages)
 
-    # ------------------------------
-    # DOMAIN FIX APPLIED HERE
-    # ------------------------------
+    # ---- FIXED DOMAIN DETECTION ----
     raw_domain = detect_domain_llm(full_text)
     domain_label = normalize_domain(raw_domain)
 
-    # Save document
     doc = UploadedDocument.objects.create(
         user_id=user_id,
         title=original_name or Path(file_path).name,
@@ -188,7 +184,6 @@ def index_document(
 
     vectors_to_upsert = []
 
-    # process each page → section → chunk
     for page_num, page_text in pages:
         sections = detect_sections(page_text)
 
@@ -227,7 +222,6 @@ def index_document(
                     pinecone_id=chunk_uuid,
                 )
 
-    # embed + upsert
     texts = [v["text"] for v in vectors_to_upsert]
     embeddings = embed_texts(texts)
 
