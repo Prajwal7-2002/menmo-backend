@@ -1,8 +1,13 @@
 # rag/pipeline.py
 from typing import Optional, Dict, Any, List
 
-from .retrieval import retrieve, MIN_SCORE_THRESHOLD
+from .retrieval import retrieve  # MIN_SCORE_THRESHOLD removed — not needed anymore
 from .llm import call_llm_answer
+
+
+# Minimum match confidence before rejecting completely
+LOW_CONF_THRESHOLD = 0.35   # was too strict before → now more LLM answers
+
 
 REPHRASE_MSG = (
     "I don’t know based on the available documentation. "
@@ -11,6 +16,10 @@ REPHRASE_MSG = (
 
 
 def _fail(reason: str, chunks=None, confidence: float = 0.0) -> Dict[str, Any]:
+    """
+    Returned only if retrieval confidence is extremely low.
+    Still shows chunks so user can refine their query or give feedback.
+    """
     fallback = chunks[0]["text"] if chunks else REPHRASE_MSG
     return {
         "answer": fallback,
@@ -30,53 +39,48 @@ def run_rag(
     history: Optional[List[Dict[str, str]]] = None,
     max_chunks: int = 4,
 ) -> Dict[str, Any]:
-    """
-    High-level RAG pipeline:
-      - retrieve candidates
-      - apply confidence gate
-      - fuse chunks into context
-      - call LLM with hallucination guard
-    """
 
-    # 1) Retrieve candidate chunks
+    # ------------------ 1) Retrieve relevant chunks --------------------
     candidates = retrieve(
         query=query,
         user_id=user_id,
         domain=domain,
         document_id=document_id,
-        top_k=max_chunks * 2,
+        top_k=max_chunks * 2, # retrieve more → filter later
     )
 
     if not candidates:
         return _fail("no_relevant_documents", [], 0.0)
 
-    # 2) Confidence gate
     top = candidates[0]
-    if top["score"] < MIN_SCORE_THRESHOLD:
+
+    # ------------------ 2) Confidence Gate (relaxed 🔥) --------------------
+    if top["score"] < LOW_CONF_THRESHOLD:
+        # Still return chunks so LLM can reference if user rewrites question
         return _fail("low_confidence_match", candidates, top["score"])
 
-    # 3) Choose chunks for context
+    # ------------------ 3) Build grounding context --------------------
     chosen = candidates[:max_chunks]
     context = "\n\n---\n\n".join([c["text"] for c in chosen])
 
-    # 3.1 Add conversational history if provided
-    if history and isinstance(history, list):
+    # attach previous conversation memory if present
+    if history:
         try:
-            history_text = "\n".join(
+            memory = "\n".join(
                 f"{h.get('role', 'user')}: {h.get('content', '')}"
-                for h in history
-                if h.get("content")
+                for h in history if h.get("content")
             )
-            if history_text:
-                context = history_text + "\n\n---\n\n" + context
-        except Exception:
+            if memory:
+                context = memory + "\n\n---\n\n" + context
+        except:
             pass
 
-    # 4) LLM call with grounding
+    # ------------------ 4) Final LLM Generation --------------------
     try:
-        llm_answer = call_llm_answer(query, context, mood=mood)
-        if not llm_answer or not llm_answer.strip():
-            # fallback to best chunk
+        response = call_llm_answer(query, context, mood=mood)
+
+        # If LLM gives empty → fallback to most relevant chunk
+        if not response or not response.strip():
             return {
                 "answer": chosen[0]["text"],
                 "validated": True,
@@ -85,15 +89,15 @@ def run_rag(
                 "note": "fallback_used_empty_llm",
             }
 
-        answer = llm_answer.strip()
         return {
-            "answer": answer,
+            "answer": response.strip(),
             "validated": True,
             "confidence": top["score"],
             "chunks": chosen,
         }
 
     except Exception as e:
+        # Retrieval succeeded but LLM failed → safe fallback
         return {
             "answer": chosen[0]["text"],
             "validated": True,
