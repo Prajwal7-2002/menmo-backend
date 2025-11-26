@@ -24,7 +24,7 @@ from rag.models import UploadedDocument, ChunkFeedback, DocumentChunk
 from rag.pipeline import run_rag
 from rag.loader import index_document
 from rag.agent import build_agent
-
+from rag.memory import load_buffer
 
 # ---------------------------------------------------------
 # ASK API
@@ -285,3 +285,14 @@ class AgentAskAPIView(APIView):
         )
 
         return Response({"answer": answer, "validated": True, "chunks": [], "agent_mode": True})
+    
+
+
+
+class ChatHistoryAPIView(APIView):
+    permission_classes=[IsAuthenticated]
+
+    def get(self, request):
+        history = load_buffer(request.user)  # pulls last 10 messages
+        return Response({"history":history})
+
