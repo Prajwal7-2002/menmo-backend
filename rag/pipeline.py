@@ -1,7 +1,7 @@
 from typing import Optional, Dict, Any, List
 from .retrieval import retrieve
 from .llm import call_llm_answer
-from .models import QueryLog   # <-- required for feedback logging
+  # <-- required for feedback logging
 
 LOW_CONF_THRESHOLD = 0.35
 
