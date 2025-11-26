@@ -37,53 +37,55 @@ def call_llm_answer(
     context: str,
     mood: str = "neutral",
     max_tokens: int = 256,
-    temperature: float = 0.0,
-) -> str:
-    """
-    Uses Groq to generate an answer grounded in the context.
-    mood: "neutral" | "serious" | "joke" | "emotional" | "friendly"
-    Returns answer string (may be empty), never raises.
-    """
+):
     if not GROQ_API_KEY:
-        print("[LLM ANSWER] GROQ_API_KEY not set, returning empty answer")
+        print("[LLM] Missing API KEY")
         return ""
 
-    # Map mood to temperature (override incoming temperature for consistent styles)
-    mood_map = {
-        "neutral": 0.3,
-        "serious": 0.1,
-        "joke": 0.9,
-        "emotional": 0.7,
-        "friendly": 0.6,
-    }
-    temperature = mood_map.get(mood, mood_map["neutral"])
+    mood_style = {
+        "neutral": "Clear and factual.",
+        "friendly": "Warm, helpful, encouraging tone.",
+        "formal": "Structured professional tone.",
+        "joke": "Light humorous tone.",
+        "emotional": "Expressive, empathetic tone.",
+    }.get(mood, "neutral")
 
-    headers = {
-        "Authorization": f"Bearer {GROQ_API_KEY}",
-        "Content-Type": "application/json",
-    }
     payload = {
         "model": GROQ_MODEL,
         "messages": [
-            {"role": "system", "content": "You MUST answer only using the given context."},
             {
-                "role": "user",
-                "content": ANSWER_PROMPT.format(context=context, question=question, mood=mood),
+                "role": "system",
+                "content": 
+                f"""
+                You are a Retrieval-Augmented assistant.
+
+                RULES FOR ANSWERING:
+                - Use ONLY the information inside the provided context
+                - Do NOT invent facts or hallucinate
+                - If answer is not found, respond only with:
+                  "I don’t know based on the available documentation."
+
+                Tone style → {mood_style}
+
+                ---------------- CONTEXT ----------------
+                {context}
+                -----------------------------------------
+                """,
             },
+            {"role": "user", "content": question},
         ],
         "max_tokens": max_tokens,
-        "temperature": temperature,
+        "temperature": 0.2,   # deterministic, factual
+        "top_p": 0.9
     }
 
     try:
-        resp = requests.post(GROQ_URL, headers=headers, json=payload, timeout=30)
+        resp = requests.post(GROQ_URL, headers={"Authorization": f"Bearer {GROQ_API_KEY}"}, json=payload)
         resp.raise_for_status()
-        data = resp.json()
-        content = data["choices"][0]["message"]["content"]
-        return (content or "").strip()
+        return resp.json()["choices"][0]["message"]["content"].strip()
     except Exception as e:
-        print("[LLM ANSWER ERROR]", e)
-        return ""  # <-- never return None
+        print("\n❌ LLM Answer Error:", e)
+        return ""
 
 
 # Backwards-compat for old imports: call_llm(...).

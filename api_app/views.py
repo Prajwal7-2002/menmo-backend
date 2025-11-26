@@ -40,9 +40,10 @@ class AskAPIView(APIView):
         req_mood = request.data.get("mood")
         provided_history = request.data.get("history", []) or []
 
+        from rag.models import QueryLog  # import inside to avoid circular
+
         prefs = load_user_preferences(request.user)
-        default_mood = prefs.get("default_mood", "neutral")
-        mood = req_mood or default_mood
+        mood = req_mood or prefs.get("default_mood", "neutral")
 
         buffer = load_buffer(request.user)
         summary = load_summary(request.user)
@@ -56,36 +57,28 @@ class AskAPIView(APIView):
             final_history.extend(provided_history)
         final_history = prune_buffer(final_history)
 
-        active_domain = request.session.get("active_domain")
-        document_id = request.data.get("document_id")
-
         result = run_rag(
             query=query,
             user_id=request.user.id,
-            domain=active_domain,
-            document_id=document_id,
+            domain=request.session.get("active_domain"),
+            document_id=request.data.get("document_id"),
             mood=mood,
             history=final_history,
         )
 
-        top_score = result["chunks"][0]["score"] if result.get("chunks") else 0.0
-
-        QueryLog.objects.create(
-            id=uuid.uuid4(),
+        # Save query log properly
+        q = QueryLog.objects.create(
             user=request.user,
             query=query,
-            answer=result.get("answer", "")[:4000],
-            top_score=top_score,
+            answer=result["answer"][:4000],
+            top_score=result["confidence"],
             chunks=result.get("chunks", []),
         )
 
-        query_id = str(uuid.uuid4())   # generated once
+        result["query_id"] = str(q.id)   # 🔥 REAL query_id returned to frontend
 
-        return Response({
-            "query": query,            # <── visible for postman response
-            "query_id": query_id,
-            **result
-        })
+        return Response(result)
+
 
 
 

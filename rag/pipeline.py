@@ -1,13 +1,9 @@
-# rag/pipeline.py
 from typing import Optional, Dict, Any, List
-
-from .retrieval import retrieve  # MIN_SCORE_THRESHOLD removed — not needed anymore
+from .retrieval import retrieve
 from .llm import call_llm_answer
+from .models import QueryLog   # <-- required for feedback logging
 
-
-# Minimum match confidence before rejecting completely
-LOW_CONF_THRESHOLD = 0.35   # was too strict before → now more LLM answers
-
+LOW_CONF_THRESHOLD = 0.35
 
 REPHRASE_MSG = (
     "I don’t know based on the available documentation. "
@@ -16,17 +12,24 @@ REPHRASE_MSG = (
 
 
 def _fail(reason: str, chunks=None, confidence: float = 0.0) -> Dict[str, Any]:
-    """
-    Returned only if retrieval confidence is extremely low.
-    Still shows chunks so user can refine their query or give feedback.
-    """
+    """Fallback when retrieval is too weak — still logs QueryLog so feedback works."""
+    
     fallback = chunks[0]["text"] if chunks else REPHRASE_MSG
+
+    log = QueryLog.objects.create(
+        query="(no context match)",
+        answer=fallback,
+        top_score=confidence,
+        chunks=chunks or [],
+    )
+
     return {
         "answer": fallback,
         "validated": False,
         "confidence": confidence,
         "reason": reason,
         "chunks": chunks or [],
+        "query_id": str(log.id),  # <-- Needed for feedback
     }
 
 
@@ -40,13 +43,13 @@ def run_rag(
     max_chunks: int = 4,
 ) -> Dict[str, Any]:
 
-    # ------------------ 1) Retrieve relevant chunks --------------------
+    # 1) Retrieve chunks
     candidates = retrieve(
         query=query,
         user_id=user_id,
         domain=domain,
         document_id=document_id,
-        top_k=max_chunks * 2, # retrieve more → filter later
+        top_k=max_chunks * 2,
     )
 
     if not candidates:
@@ -54,20 +57,19 @@ def run_rag(
 
     top = candidates[0]
 
-    # ------------------ 2) Confidence Gate (relaxed 🔥) --------------------
+    # 2) Confidence control
     if top["score"] < LOW_CONF_THRESHOLD:
-        # Still return chunks so LLM can reference if user rewrites question
         return _fail("low_confidence_match", candidates, top["score"])
 
-    # ------------------ 3) Build grounding context --------------------
+    # 3) Build RAG context
     chosen = candidates[:max_chunks]
     context = "\n\n---\n\n".join([c["text"] for c in chosen])
 
-    # attach previous conversation memory if present
+    # Conversation history support
     if history:
         try:
             memory = "\n".join(
-                f"{h.get('role', 'user')}: {h.get('content', '')}"
+                f"{h.get('role','user')}: {h.get('content','')}" 
                 for h in history if h.get("content")
             )
             if memory:
@@ -75,33 +77,25 @@ def run_rag(
         except:
             pass
 
-    # ------------------ 4) Final LLM Generation --------------------
+    # 4) LLM Answering Phase
     try:
         response = call_llm_answer(query, context, mood=mood)
+        final_answer = response.strip() if response else chosen[0]["text"]
+    except Exception:
+        final_answer = chosen[0]["text"]
 
-        # If LLM gives empty → fallback to most relevant chunk
-        if not response or not response.strip():
-            return {
-                "answer": chosen[0]["text"],
-                "validated": True,
-                "confidence": top["score"],
-                "chunks": chosen,
-                "note": "fallback_used_empty_llm",
-            }
+    # 5) Save + Return Query ID (important!)
+    log = QueryLog.objects.create(
+        query=query,
+        answer=final_answer,
+        top_score=top["score"],
+        chunks=chosen,
+    )
 
-        return {
-            "answer": response.strip(),
-            "validated": True,
-            "confidence": top["score"],
-            "chunks": chosen,
-        }
-
-    except Exception as e:
-        # Retrieval succeeded but LLM failed → safe fallback
-        return {
-            "answer": chosen[0]["text"],
-            "validated": True,
-            "confidence": top["score"],
-            "chunks": chosen,
-            "note": f"fallback_used_due_to_llm_error: {e}",
-        }
+    return {
+        "answer": final_answer,
+        "validated": True,
+        "confidence": top["score"],
+        "chunks": chosen,
+        "query_id": str(log.id),  # <-- now frontend can send feedback → FIXED
+    }
