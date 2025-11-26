@@ -38,14 +38,15 @@ def call_llm_answer(
     mood: str = "neutral",
     max_tokens: int = 256,
     temperature: float = 0.0,
-):
+) -> str:
     """
     Uses Groq to generate an answer grounded in the context.
     mood: "neutral" | "serious" | "joke" | "emotional" | "friendly"
-    Returns answer string or None if any error.
+    Returns answer string (may be empty), never raises.
     """
     if not GROQ_API_KEY:
-        return None
+        print("[LLM ANSWER] GROQ_API_KEY not set, returning empty answer")
+        return ""
 
     # Map mood to temperature (override incoming temperature for consistent styles)
     mood_map = {
@@ -55,7 +56,6 @@ def call_llm_answer(
         "emotional": 0.7,
         "friendly": 0.6,
     }
-    # If user passes an unknown mood, fallback to neutral
     temperature = mood_map.get(mood, mood_map["neutral"])
 
     headers = {
@@ -79,15 +79,16 @@ def call_llm_answer(
         resp = requests.post(GROQ_URL, headers=headers, json=payload, timeout=30)
         resp.raise_for_status()
         data = resp.json()
-        return data["choices"][0]["message"]["content"].strip()
+        content = data["choices"][0]["message"]["content"]
+        return (content or "").strip()
     except Exception as e:
         print("[LLM ANSWER ERROR]", e)
-        return None
+        return ""  # <-- never return None
 
 
-# Backwards-compat for old imports: call_llm(...)
-def call_llm(question: str, context: str, max_tokens: int = 256):
-    # keep behaviour stable: neutral mood, deterministic temperature 0.0 for compatibility
+# Backwards-compat for old imports: call_llm(...).
+def call_llm(question: str, context: str, max_tokens: int = 256) -> str:
+    # keep behaviour stable: neutral mood
     return call_llm_answer(question, context, mood="neutral", max_tokens=max_tokens, temperature=0.0)
 
 
@@ -116,8 +117,9 @@ def detect_domain_llm(text: str) -> str:
     Use LLM to automatically infer a broad domain/category
     without any predefined label list.
     Ensures stable, reusable domains.
-    """
 
+    Returns a safe string, defaults to "general" if anything fails.
+    """
     prompt = f"""
     You are a classification agent. Your job is to assign a short, high-level domain to a document.
 
@@ -129,15 +131,26 @@ def detect_domain_llm(text: str) -> str:
     - NO predefined labels required — infer the best possible category
 
     Document content:
-    {text[:5000]}  # only first ~5k chars for speed.
+    {text[:5000]}
 
     Respond with ONLY the domain name. No explanations.
     """
 
-    domain = call_llm_answer("infer_domain", prompt).strip().lower()
+    raw = call_llm_answer(
+        question="Infer a domain for this document.",
+        context=prompt,
+        mood="neutral",
+        max_tokens=16,
+    )
 
-    # final cleanup
+    if not raw:
+        return "general"
+
+    domain = raw.strip().lower()
     domain = domain.replace(".", "").replace(",", "")
     domain = domain.replace(" ", "_")
+
+    if not domain:
+        return "general"
 
     return domain

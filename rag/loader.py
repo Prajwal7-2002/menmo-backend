@@ -2,20 +2,19 @@
 import uuid
 import re
 from pathlib import Path
-from typing import List, Tuple, Dict, Any, Optional
+from typing import List, Tuple, Dict, Any
 
 from .retrieval import embed_texts, upsert_vectors
 from .llm import detect_domain_llm
 from .models import UploadedDocument, DocumentChunk
 
 
-# ---------------------------------------------------------
-# PDF TEXT EXTRACTION (with OCR fallback)
-# ---------------------------------------------------------
+# ========================== TEXT EXTRACTION =============================== #
+
 def extract_text_from_pdf(path: str) -> List[Tuple[int, str]]:
     pages: List[Tuple[int, str]] = []
 
-    # -------- 1) pdfplumber --------
+    # 1) Try pdfplumber
     try:
         import pdfplumber
         with pdfplumber.open(path) as pdf:
@@ -27,9 +26,8 @@ def extract_text_from_pdf(path: str) -> List[Tuple[int, str]]:
             return pages
     except Exception as e:
         print("[PDF] pdfplumber failed:", e)
-        pages = []
 
-    # -------- 2) PyPDF fallback --------
+    # 2) Try pypdf fallback
     try:
         from pypdf import PdfReader
         reader = PdfReader(path)
@@ -37,30 +35,24 @@ def extract_text_from_pdf(path: str) -> List[Tuple[int, str]]:
         for i, page in enumerate(reader.pages):
             try:
                 txt = page.extract_text() or ""
-            except:
+            except Exception:
                 txt = ""
             pages.append((i + 1, txt))
-
         if any(p[1].strip() for p in pages):
             print("[PDF] Extracted via pypdf")
             return pages
     except Exception as e:
         print("[PDF] pypdf failed:", e)
-        pages = []
 
-    # -------- 3) OCR fallback --------
+    # 3) OCR fallback
     try:
         from pdf2image import convert_from_path
         import pytesseract
-
         print("[PDF] OCR fallback enabled")
-        images = convert_from_path(path, dpi=300)
-
         pages = []
-        for i, img in enumerate(images):
-            txt = pytesseract.image_to_string(img)
-            pages.append((i + 1, txt))
-
+        for i, img in enumerate(convert_from_path(path, dpi=300)):
+            text = pytesseract.image_to_string(img)
+            pages.append((i + 1, text))
         return pages
     except Exception as e:
         print("[PDF] OCR failed:", e)
@@ -71,7 +63,7 @@ def extract_text_from_pdf(path: str) -> List[Tuple[int, str]]:
 def extract_text_from_docx(path: str) -> List[Tuple[int, str]]:
     import docx
     doc = docx.Document(path)
-    return [(1, "\n".join([p.text for p in doc.paragraphs]))]
+    return [(1, "\n".join(p.text for p in doc.paragraphs))]
 
 
 def extract_text_from_txt(path: str) -> List[Tuple[int, str]]:
@@ -81,29 +73,21 @@ def extract_text_from_txt(path: str) -> List[Tuple[int, str]]:
 
 def extract_text(path: str) -> List[Tuple[int, str]]:
     ext = Path(path).suffix.lower()
-
-    if ext == ".pdf":
-        return extract_text_from_pdf(path)
-    if ext == ".docx":
-        return extract_text_from_docx(path)
-    if ext in [".txt", ".md"]:
-        return extract_text_from_txt(path)
-
-    # default fallback
-    return extract_text_from_pdf(path)
+    if ext == ".pdf": return extract_text_from_pdf(path)
+    if ext == ".docx": return extract_text_from_docx(path)
+    if ext in [".txt", ".md"]: return extract_text_from_txt(path)
+    return extract_text_from_pdf(path)  # default fallback
 
 
-# ---------------------------------------------------------
-# SECTION DETECTION
-# ---------------------------------------------------------
+# ========================== SECTION SPLITTING ============================ #
+
 def detect_sections(page_text: str):
     lines = page_text.splitlines()
     headings = []
 
     for i, line in enumerate(lines):
         s = line.strip()
-        if not s:
-            continue
+        if not s: continue
         if s.isupper() and len(s) > 3:
             headings.append((i, s))
         elif re.match(r"^\d+[\.\)]\s+\S+", s):
@@ -118,16 +102,13 @@ def detect_sections(page_text: str):
     for idx, (line_idx, title) in enumerate(headings):
         start = line_idx
         end = headings[idx + 1][0] if idx + 1 < len(headings) else len(lines)
-        sec = "\n".join(lines[start:end]).strip()
-        sections.append((title, sec))
-
+        sections.append((title, "\n".join(lines[start:end]).strip()))
     return sections
 
 
-# ---------------------------------------------------------
-# CHUNKING
-# ---------------------------------------------------------
-def chunk_text(text: str, size: int = 1500, overlap: int = 200):
+# ============================= CHUNKING ================================= #
+
+def chunk_text(text: str, size: int = 500, overlap: int = 100):
     clean = re.sub(r"\s+", " ", text).strip()
     if not clean:
         return []
@@ -135,49 +116,45 @@ def chunk_text(text: str, size: int = 1500, overlap: int = 200):
     if len(clean) <= size:
         return [clean]
 
-    res = []
+    chunks = []
     start = 0
     while start < len(clean):
         end = start + size
-        res.append(clean[start:end])
-        if end >= len(clean):
-            break
+        chunks.append(clean[start:end])
+        if end >= len(clean): break
         start = end - overlap
-    return res
+    return chunks
 
 
-# ---------------------------------------------------------
-# NORMALIZE DOMAIN
-# ---------------------------------------------------------
+# ============================= DOMAIN CLEANING =========================== #
+
 def normalize_domain(raw: str) -> str:
-    if not raw:
-        return "general"
-
+    if not raw: return "general"
     r = re.sub(r"[^a-z0-9 ]+", "", raw.lower()).strip().replace(" ", "_")
-
-    if r.isdigit() or len(r) < 3:
-        return "general"
-
+    if r.isdigit() or len(r) < 3: return "general"
     return r[:50]
 
 
-# ---------------------------------------------------------
-# MAIN INDEXING PIPELINE
-# ---------------------------------------------------------
+# ============================= INDEXING PIPELINE ========================= #
+
 def index_document(file_path: str, user_id: int, original_name: str) -> Dict[str, Any]:
-    print(f"[index_document] Starting: {file_path}")
+    print(f"\n[index_document] Processing → {file_path}")
 
     pages = extract_text(file_path)
-    print(f"[index_document] Pages extracted: {len(pages)}")
+    print(f"[index_document] Pages extracted = {len(pages)}")
 
     if not pages:
-        print("[index_document] No text extracted — aborting")
         return {"document_id": None, "chunks_indexed": 0, "domain": "general"}
 
-    full_text = "\n".join([p[1] for p in pages])
+    raw_text = "\n".join(p[1] for p in pages)
 
-    raw_domain = detect_domain_llm(full_text)
+    try:
+        raw_domain = detect_domain_llm(raw_text)
+    except:
+        raw_domain = "general"
+
     domain = normalize_domain(raw_domain)
+    print(f"[index_document] Domain → {domain}")
 
     doc = UploadedDocument.objects.create(
         user_id=user_id,
@@ -185,22 +162,20 @@ def index_document(file_path: str, user_id: int, original_name: str) -> Dict[str
         original_filename=original_name,
         domain=domain,
     )
-
-    print(f"[index_document] Created Document ID {doc.id} domain={domain}")
+    print(f"[index_document] Document ID = {doc.id}")
 
     vectors = []
-    for page_num, page_text in pages:
-        sections = detect_sections(page_text)
+    global_idx = 0  # 🌟 sequential chunk numbering across whole file
 
-        for s_idx, (title, sec_text) in enumerate(sections):
-            chunks = chunk_text(sec_text)
-            for c_idx, ctext in enumerate(chunks):
+    for page_num, page_text in pages:
+        for s_idx, (title, sec_text) in enumerate(detect_sections(page_text)):
+            for chunk in chunk_text(sec_text):  # 500 tokens, 100 overlap
                 cid = str(uuid.uuid4())
-                snippet = ctext[:300]
+                snippet = chunk[:300]
 
                 vectors.append({
                     "id": cid,
-                    "text": ctext,
+                    "text": chunk,
                     "metadata": {
                         "user_id": str(user_id),
                         "document_id": str(doc.id),
@@ -208,15 +183,16 @@ def index_document(file_path: str, user_id: int, original_name: str) -> Dict[str
                         "page_num": page_num,
                         "section_idx": s_idx,
                         "section_title": title,
-                        "chunk_idx": c_idx,
+                        "chunk_idx": global_idx,   # 🔥 important fix
                         "snippet": snippet,
+                        "chunk_text": chunk,
                     }
                 })
 
                 DocumentChunk.objects.create(
                     id=cid,
                     document=doc,
-                    chunk_idx=c_idx,
+                    chunk_idx=global_idx,
                     section_idx=s_idx,
                     section_title=title,
                     page_num=page_num,
@@ -224,21 +200,19 @@ def index_document(file_path: str, user_id: int, original_name: str) -> Dict[str
                     pinecone_id=cid,
                 )
 
-    print(f"[index_document] Chunks generated: {len(vectors)}")
+                global_idx += 1
 
-    # Embed + upsert
-    texts = [v["text"] for v in vectors]
-    emb = embed_texts(texts)
-    upsert_items = [
-        {"id": vec["id"], "values": e, "metadata": vec["metadata"]}
-        for vec, e in zip(vectors, emb)
-    ]
+    print(f"[index_document] Total Chunks = {global_idx}")
 
-    print(f"[index_document] Upserting vectors: {len(upsert_items)}")
-    upsert_vectors(upsert_items)
+    try:
+        txts = [v["text"] for v in vectors]
+        embs = embed_texts(txts)
+        upsert_vectors([
+            {"id": v["id"], "values": e, "metadata": v["metadata"]}
+            for v, e in zip(vectors, embs)
+        ])
+        return {"document_id": str(doc.id), "chunks_indexed": global_idx, "domain": domain}
 
-    return {
-        "document_id": str(doc.id),
-        "chunks_indexed": len(upsert_items),
-        "domain": domain,
-    }
+    except Exception as e:
+        print(f"❌ Embedding failed: {e}")
+        return {"document_id": str(doc.id), "chunks_indexed": 0, "domain": domain}

@@ -37,7 +37,6 @@ class AskAPIView(APIView):
         serializer.is_valid(raise_exception=True)
 
         query = serializer.validated_data["query"]
-
         req_mood = request.data.get("mood")
         provided_history = request.data.get("history", []) or []
 
@@ -48,7 +47,6 @@ class AskAPIView(APIView):
         buffer = load_buffer(request.user)
         summary = load_summary(request.user)
 
-        # Build final memory
         final_history = []
         if summary:
             final_history.append({"role": "system", "content": f"Summary: {summary}"})
@@ -81,7 +79,14 @@ class AskAPIView(APIView):
             chunks=result.get("chunks", []),
         )
 
-        return Response({"query_id": str(uuid.uuid4()), **result})
+        query_id = str(uuid.uuid4())   # generated once
+
+        return Response({
+            "query": query,            # <── visible for postman response
+            "query_id": query_id,
+            **result
+        })
+
 
 
 # ---------------------------------------------------------
