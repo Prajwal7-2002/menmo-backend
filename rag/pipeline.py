@@ -1,7 +1,9 @@
 from typing import Optional, Dict, Any, List
 from .retrieval import retrieve
 from .llm import call_llm_answer
-  # <-- required for feedback logging
+
+# 🔥 REAL LOCATION → must import here
+from api_app.models import QueryLog  
 
 LOW_CONF_THRESHOLD = 0.35
 
@@ -12,12 +14,11 @@ REPHRASE_MSG = (
 
 
 def _fail(reason: str, chunks=None, confidence: float = 0.0) -> Dict[str, Any]:
-    """Fallback when retrieval is too weak — still logs QueryLog so feedback works."""
-    
     fallback = chunks[0]["text"] if chunks else REPHRASE_MSG
 
+    # Log query even if fail — so feedback still works
     log = QueryLog.objects.create(
-        query="(no context match)",
+        query="(weak/no match)",
         answer=fallback,
         top_score=confidence,
         chunks=chunks or [],
@@ -29,7 +30,7 @@ def _fail(reason: str, chunks=None, confidence: float = 0.0) -> Dict[str, Any]:
         "confidence": confidence,
         "reason": reason,
         "chunks": chunks or [],
-        "query_id": str(log.id),  # <-- Needed for feedback
+        "query_id": str(log.id),
     }
 
 
@@ -43,7 +44,7 @@ def run_rag(
     max_chunks: int = 4,
 ) -> Dict[str, Any]:
 
-    # 1) Retrieve chunks
+    # --- 1) Retrieve ---
     candidates = retrieve(
         query=query,
         user_id=user_id,
@@ -57,45 +58,37 @@ def run_rag(
 
     top = candidates[0]
 
-    # 2) Confidence control
+    # --- 2) Low confidence Fallback ---
     if top["score"] < LOW_CONF_THRESHOLD:
         return _fail("low_confidence_match", candidates, top["score"])
 
-    # 3) Build RAG context
     chosen = candidates[:max_chunks]
     context = "\n\n---\n\n".join([c["text"] for c in chosen])
 
-    # Conversation history support
+    # --- History Merge ---
     if history:
-        try:
-            memory = "\n".join(
-                f"{h.get('role','user')}: {h.get('content','')}" 
-                for h in history if h.get("content")
-            )
-            if memory:
-                context = memory + "\n\n---\n\n" + context
-        except:
-            pass
+        memory = "\n".join(f"{m['role']}: {m['content']}" for m in history)
+        context = memory + "\n\n---\n\n" + context
 
-    # 4) LLM Answering Phase
+    # --- 3) LLM Generation ---
     try:
-        response = call_llm_answer(query, context, mood=mood)
-        final_answer = response.strip() if response else chosen[0]["text"]
-    except Exception:
-        final_answer = chosen[0]["text"]
+        answer = call_llm_answer(query, context, mood=mood)
+        final = answer.strip() if answer else chosen[0]["text"]
+    except:
+        final = chosen[0]["text"]
 
-    # 5) Save + Return Query ID (important!)
+    # --- 4) Save Query Log ---
     log = QueryLog.objects.create(
         query=query,
-        answer=final_answer,
+        answer=final,
         top_score=top["score"],
         chunks=chosen,
     )
 
     return {
-        "answer": final_answer,
+        "answer": final,
         "validated": True,
         "confidence": top["score"],
         "chunks": chosen,
-        "query_id": str(log.id),  # <-- now frontend can send feedback → FIXED
+        "query_id": str(log.id)
     }
