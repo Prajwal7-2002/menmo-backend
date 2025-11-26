@@ -40,7 +40,8 @@ class AskAPIView(APIView):
         req_mood = request.data.get("mood")
         provided_history = request.data.get("history", []) or []
 
-        from rag.models import QueryLog  # import inside to avoid circular
+        # ❌ REMOVE THIS LINE:
+        # from rag.models import QueryLog
 
         prefs = load_user_preferences(request.user)
         mood = req_mood or prefs.get("default_mood", "neutral")
@@ -66,7 +67,6 @@ class AskAPIView(APIView):
             history=final_history,
         )
 
-        # Save query log properly
         q = QueryLog.objects.create(
             user=request.user,
             query=query,
@@ -75,10 +75,9 @@ class AskAPIView(APIView):
             chunks=result.get("chunks", []),
         )
 
-        result["query_id"] = str(q.id)   # 🔥 REAL query_id returned to frontend
+        result["query_id"] = str(q.id)
 
         return Response(result)
-
 
 
 
