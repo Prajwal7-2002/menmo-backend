@@ -162,6 +162,37 @@ class SwitchDomainAPIView(APIView):
         if not domain:return Response({"detail":"domain required"},400)
         request.session["active_domain"]=domain;request.session.save()
         return Response({"detail":f"Domain -> {domain}"})
+    
+
+# -------------------------------------------------------
+# CREATE NEW CHAT SESSION
+# -------------------------------------------------------
+class CreateConversationAPIView(APIView):
+    permission_classes = [IsAuthenticated]
+
+    def post(self, request):
+        conv = Conversation.objects.create(user=request.user)
+        return Response({"id": str(conv.id)}, status=201)
+    
+
+# -------------------------------------------------------
+# LIST ALL CONVERSATIONS (REQUIRED for URL import)
+# -------------------------------------------------------
+class ConversationListAPIView(APIView):
+    permission_classes = [IsAuthenticated]
+
+    def get(self, request):
+        chats = Conversation.objects.filter(user=request.user).order_by("-updated_at")
+        return Response([
+            {
+                "id": str(c.id),
+                "title": c.title,
+                "updated_at": c.updated_at
+            }
+            for c in chats
+        ])
+
+
 
 
 # -------------------------------------------------------

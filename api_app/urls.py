@@ -7,7 +7,6 @@ from .views import (
     DocumentListAPIView,
     DocumentDeleteAPIView,
     SwitchDomainAPIView,
-    AgentAskAPIView,
     CreateConversationAPIView,
     ConversationListAPIView,
     ConversationChatAPIView,
@@ -26,7 +25,6 @@ urlpatterns = [
 
     path("delete-document/<uuid:doc_id>/", DocumentDeleteAPIView.as_view(), name="delete_document"),
     path("switch-domain/", SwitchDomainAPIView.as_view(), name="switch_domain"),
-    path("ask-agent/", AgentAskAPIView.as_view()),
     # 🧵 multi-chat
     path("conversations/", CreateConversationAPIView.as_view(), name="create_conversation"),
     path("conversations/list/", ConversationListAPIView.as_view(), name="list_conversations"),
