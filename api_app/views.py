@@ -295,6 +295,7 @@ class ConversationChatAPIView(APIView):
         memory = load_vector_memory(request.user, query)
 
         # ================== AGENT MODE ================== #
+# ================== AGENT MODE ================== #
         if agent_mode:
             agent = build_agent(
                 user_id     = request.user.id,
@@ -302,7 +303,11 @@ class ConversationChatAPIView(APIView):
                 document_id = document_id,
                 mood        = mood,
                 history     = memory,
-            )
+                agent_enabled = True      # 🔥 THIS IS THE KEY
+)
+
+
+            agent.agent_enabled = True      #  <<< REQUIRED 🔥🔥
 
             try:
                 answer = agent.run(query)
@@ -314,11 +319,8 @@ class ConversationChatAPIView(APIView):
             Message.objects.create(conversation=conv, role="assistant",  content=answer)
             store_conversation_turn(request.user, query, answer)
 
-            # No chunks/query_id here – frontend already handles missing fields
-            return Response({
-                "answer": answer,
-                "mode": "agent",
-            }, status=200)
+            return Response({"answer": answer, "mode": "agent"}, status=200)
+
 
         # ================== RAG MODE (DEFAULT) ================== #
         response = run_rag(
@@ -335,6 +337,8 @@ class ConversationChatAPIView(APIView):
         Message.objects.create(conversation=conv, role="assistant", content=response.get("answer", ""))
 
         store_conversation_turn(request.user, query, response.get("answer", ""))
+        print("🔥 agent_mode =", request.data.get("agent_mode"))
+
 
         return Response(response, status=200)
 

@@ -205,57 +205,57 @@ def build_agent(
 
             return LCAgent(executor, user_id, domain, document_id, default_mood, history)
 
-    # ---------- Fallback: simple, non-LangChain agent ---------- #
-    class SimpleAgent:
-        def __init__(self, user_id, domain, document_id, mood, history):
-            self.user_id = user_id
-            self.domain = domain
-            self.document_id = document_id
-            self.mood = mood
-            self.history = history or []
+    
+    
+# ---------- Fallback: SIMPLE AGENT (RAG → Web → LLM fallback) ---------- #
+class SimpleAgent:
+    def __init__(self, user_id, domain, document_id, mood, history, agent_enabled=False):
+        self.user_id = user_id
+        self.domain = domain
+        self.document_id = document_id
+        self.mood = mood
+        self.history = history or []
+        self.agent_enabled = agent_enabled  # ← KEY CHANGE
 
-        def run(self, query: str) -> str:
-            q = (query or "").strip()
-            if not q:
-                return "No query provided."
+    def run(self, query: str) -> str:
+        q = (query or "").strip()
+        if not q:
+            return "No query provided."
 
-            try:
-                # 1) RAG first
-                rag_res = _rag_call(
-                    q,
-                    user_id=self.user_id,
-                    domain=self.domain,
-                    document_id=self.document_id,
-                    mood=self.mood,
-                    history=self.history,
-                )
+        # ALWAYS FIRST → RAG lookup
+        rag_res = _rag_call(
+            q,
+            user_id=self.user_id,
+            domain=self.domain,
+            document_id=self.document_id,
+            mood=self.mood,
+            history=self.history,
+        )
+        if rag_res.get("validated"):
+            return rag_res["answer"]     # Found in your docs 🔥
+        
+        # ---- If agent is OFF — STOP HERE ----
+        if not self.agent_enabled:
+            return "No strong match found in your uploaded documents. (Agent mode is OFF)"
 
-                if rag_res.get("validated"):
-                    return rag_res.get("answer") or "No answer found in documents."
+        # ---- Agent Mode → Web + LLM fallback ----
+        web = _internet_search_raw(q)
+        if "No web results" not in web:
+            return f"{web}\n\n[Agent Mode - Web Result]"
 
-                # 2) Web search
-                web = _internet_search_raw(q)
-                if "No web results" not in web:
-                    return f"{web}\n\n(No strong evidence from documents, using web search.)"
+        # LLM reasoning fallback
+        try:
+            from groq import Groq
+            client = Groq(api_key=os.getenv("GROQ_API_KEY"))
+            out = client.chat.completions.create(
+                model=GROQ_MODEL,
+                messages=[
+                    {"role": "system", "content": "Answer using external knowledge."},
+                    {"role": "user", "content": q},
+                ],
+            )
+            return out.choices[0].message.content + "\n\n[Agent LLM Fallback]"
+        except:
+            pass
 
-                # 3) Groq LLM fallback
-                from groq import Groq
-                client = Groq(api_key=os.getenv("GROQ_API_KEY"))
-
-                try:
-                    completion = client.chat.completions.create(
-                        model=GROQ_MODEL,
-                        messages=[
-                            {"role": "system", "content": "You are an intelligent copilot. Use reasoning."},
-                            {"role": "user", "content": q},
-                        ],
-                    )
-                    return completion.choices[0].message.content
-                except Exception:
-                    return "I could not find the answer, even with fallback LLM."
-
-            except Exception as e:
-                logger.exception("SimpleAgent.run failed")
-                return f"Agent error: {e}"
-
-    return SimpleAgent(user_id, domain, document_id, default_mood, history)
+        return "No answer found — even Agent fallback failed."
