@@ -219,36 +219,31 @@ def build_agent(user_id: int = None,
             if not q:
                 return "No query provided."
 
+            # --- 1) Try RAG first always ---
+            rag_res = _rag_call(q, user_id=self.user_id, domain=self.domain,
+                                document_id=self.document_id, mood=self.mood, history=self.history)
+
+            if rag_res.get("validated"):
+                return rag_res.get("answer") or "No answer found in documents."
+
+            # --- 2) If RAG failed → try web ---
+            web = _internet_search_raw(q)
+
+            if "No web results" not in web:
+                return f"{web}\n\n(No strong evidence from documents, using web search.)"
+
+            # --- 3) If RAG + Web both fail → GENERIC LLM FALLBACK 🚀 ---
+            from groq import Groq
+            client = Groq(api_key=os.getenv("GROQ_API_KEY"))
+
             try:
-                # doc-y → RAG first
-                if self.document_id or _looks_document_query(q):
-                    rag_res = _rag_call(q, user_id=self.user_id, domain=self.domain,
-                                        document_id=self.document_id, mood=self.mood, history=self.history)
-                    if rag_res.get("validated"):
-                        return rag_res.get("answer") or "No answer found in documents."
-                    web = _internet_search_raw(q)
-                    chunks = rag_res.get("chunks", [])
-                    fb = chunks[0]["text"] if chunks else ""
-                    return f"{web}\n\n(Your docs had low relevance; top snippet below)\n\n{fb}"
-
-                # web-ish → web first
-                if _looks_web_query(q):
-                    web = _internet_search_raw(q)
-                    rag_res = _rag_call(q, user_id=self.user_id, domain=self.domain,
-                                        document_id=self.document_id, mood=self.mood, history=self.history)
-                    if rag_res.get("validated"):
-                        return f"{web}\n\n(Also found in your docs):\n\n{rag_res.get('answer')}"
-                    return web
-
-                # default → RAG first, then web
-                rag_res = _rag_call(q, user_id=self.user_id, domain=self.domain,
-                                    document_id=self.document_id, mood=self.mood, history=self.history)
-                if rag_res.get("validated"):
-                    return rag_res.get("answer") or "No answer found in documents."
-                web = _internet_search_raw(q)
-                return f"{web}\n\n(Your docs had low relevance — showing web result.)"
-            except Exception as e:
-                logger.exception("SimpleAgent.run failed")
-                return f"Agent error: {e}"
-
-    return SimpleAgent(user_id, domain, document_id, default_mood, history)
+                completion = client.chat.completions.create(
+                    model=GROQ_MODEL,
+                    messages=[
+                        {"role": "system","content":"You are an intelligent copilot. Use reasoning."},
+                        {"role": "user","content": q}
+                    ]
+                )
+                return completion.choices[0].message.content
+            except Exception:
+                return "I could not find the answer, even with fallback LLM."
