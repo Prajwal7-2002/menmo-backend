@@ -1,25 +1,10 @@
-# rag/agent.py
+# ========================= rag/agent.py ========================= #
+
 import os
 import logging
 from typing import List, Dict, Any, Optional
-
-from duckduckgo_search import DDGS  # 🔁 instead of Tavily
-
-# LangChain imports
-try:
-    from langchain.agents import create_react_agent, AgentExecutor
-    from langchain.tools import tool
-    from langchain_groq import ChatGroq
-    from langchain_community.utilities import DuckDuckGoSearchAPIWrapper
-except Exception:
-    create_react_agent = None
-    AgentExecutor = None
-    tool = None
-    ChatGroq = None
-    DuckDuckGoSearchAPIWrapper = None
-
+from duckduckgo_search import DDGS
 from .pipeline import run_rag
-
 
 logger = logging.getLogger(__name__)
 
@@ -27,235 +12,92 @@ GROQ_MODEL = os.getenv("GROQ_MODEL", "meta-llama/llama-4-maverick-17b-128e-instr
 GROQ_API_KEY = os.getenv("GROQ_API_KEY")
 
 
-# ------------------------ DuckDuckGo search ------------------------ #
+# ----------------------- DuckDuckGo Search ---------------------- #
 
 def _internet_search_raw(query: str) -> str:
-    """Plain DDG search without LangChain (used by fallback agent)."""
     try:
         with DDGS() as ddgs:
             results = list(ddgs.text(query, max_results=5))
         if not results:
-            return "No web results found via DuckDuckGo."
-        # Compact string summary
-        lines = []
-        for r in results:
-            title = r.get("title", "")
-            body = r.get("body", "")
-            url = r.get("href", "")
-            lines.append(f"- {title}\n  {body}\n  {url}")
-        return "DuckDuckGo results:\n\n" + "\n\n".join(lines)
+            return "No web results found."
+        return "\n\n".join(f"- {r['title']}\n  {r['body']}" for r in results)
     except Exception as e:
-        logger.exception("DuckDuckGo search failed")
-        return f"Internet search failed: {e}"
+        return f"Search failed: {e}"
 
 
-def _rag_call(query: str,
-              user_id: Optional[int] = None,
-              domain: Optional[str] = None,
-              document_id: Optional[str] = None,
-              mood: str = "neutral",
-              history: Optional[List[Dict[str, str]]] = None) -> Dict[str, Any]:
+# ----------------------- RAG Wrapper ---------------------------- #
+
+def _rag_call(query, user_id=None, domain=None, document_id=None, mood="neutral", history=None):
     try:
-        return run_rag(
-            query=query,
-            user_id=user_id,
-            domain=domain,
-            document_id=document_id,
-            mood=mood,
-            history=history,
-        )
+        return run_rag(query=query, user_id=user_id, domain=domain,
+                       document_id=document_id, mood=mood, history=history)
     except Exception as e:
-        logger.exception("run_rag failed")
-        return {"answer": f"RAG failed: {e}", "validated": False, "chunks": [], "reason": "exception"}
+        return {"answer": f"RAG error: {e}", "validated": False}
 
 
-def _looks_document_query(text: str) -> bool:
-    if not text:
-        return False
-    q = text.lower()
-    doc_keys = ["document", "pdf", "page", "section", "uploaded", "report", "appendix", "policy", "manual", "chapter"]
-    return any(k in q for k in doc_keys) or (len(q.split()) <= 3 and q.endswith("?"))
+# ------------------- Simple Agent (your default) ---------------- #
 
-
-def _looks_web_query(text: str) -> bool:
-    if not text:
-        return False
-    q = text.lower()
-    web_keys = ["latest", "news", "202", "update", "statute", "price", "rate", "current", "today"]
-    return any(k in q for k in web_keys)
-
-
-# ---------------- LangChain Tools ---------------- #
-
-if tool is not None and DuckDuckGoSearchAPIWrapper is not None:
-    ddg_wrapper = DuckDuckGoSearchAPIWrapper(max_results=5)
-
-    @tool
-    def internet_search(query: str) -> str:
-        """Use DuckDuckGo to search the web for up-to-date information."""
-        try:
-            return ddg_wrapper.run(query)
-        except Exception:
-            # fallback to raw helper
-            return _internet_search_raw(query)
-
-    @tool
-    def rag_search(query: str,
-                   user_id: int = None,
-                   domain: str = None,
-                   document_id: str = None,
-                   mood: str = "neutral",
-                   history: Optional[List[Dict[str, str]]] = None) -> str:
-        """Use RAG over user documents to answer document-grounded questions."""
-        res = _rag_call(query, user_id=user_id, domain=domain,
-                        document_id=document_id, mood=mood, history=history)
-        validated = res.get("validated", False)
-        answer = res.get("answer", "") or ""
-        if validated:
-            return f"[RAG_VALIDATED]\n{answer}"
-        chunks = res.get("chunks", [])
-        fb = chunks[0]["text"] if chunks else ""
-        return f"[RAG_LOW_RELEVANCE]\n{answer}\n\nTop chunk:\n{fb}"
-else:
-    # fallback simple callables
-    def internet_search(query: str) -> str:
-        return _internet_search_raw(query)
-
-    def rag_search(query: str,
-                   user_id: int = None,
-                   domain: str = None,
-                   document_id: str = None,
-                   mood: str = "neutral",
-                   history: Optional[List[Dict[str, str]]] = None) -> str:
-        res = _rag_call(query, user_id=user_id, domain=domain,
-                        document_id=document_id, mood=mood, history=history)
-        if res.get("validated"):
-            return res.get("answer", "")
-        chunks = res.get("chunks", [])
-        fb = chunks[0]["text"] if chunks else ""
-        return (res.get("answer") or "") + ("\n\nTop chunk:\n" + fb if fb else "")
-
-
-# ---------------- Build Agent ---------------- #
-# ---------------- Build Agent ---------------- #
-
-def build_agent(
-    user_id: int = None,
-    domain: Optional[str] = None,
-    document_id: Optional[str] = None,
-    mood: str = "neutral",
-    history: Optional[List[Dict[str, str]]] = None,
-):
-    """
-    Return an object with .run(query).
-    - If LangChain + Groq bindings are available → use ReAct agent with tools.
-    - Otherwise fall back to SimpleAgent (RAG + web + Groq fallback).
-    """
-    default_mood = mood or "neutral"
-
-    # If we have LangChain & Groq bindings, use full agent
-    if create_react_agent and AgentExecutor and ChatGroq and DuckDuckGoSearchAPIWrapper:
-        llm = ChatGroq(model=GROQ_MODEL, api_key=GROQ_API_KEY, temperature=0.3)
-
-        tools = [rag_search, internet_search]
-
-        system_instruction = (
-            "You are a document-grounded copilot. "
-            "Use the rag_search tool for queries about user-uploaded documents. "
-            "Use the internet_search tool for web/time-sensitive queries. "
-            f"Default mood: {default_mood}. Keep answers concise and grounded."
-        )
-
-        try:
-            agent_chain = create_react_agent(
-                llm=llm,
-                tools=tools,
-                system_message=system_instruction,
-            )
-            executor = AgentExecutor(agent_chain=agent_chain)
-        except Exception as e:
-            logger.exception("LangChain agent creation failed, falling back to SimpleAgent.")
-            executor = None
-
-        if executor is not None:
-            class LCAgent:
-                def __init__(self, executor, user_id, domain, document_id, mood, history):
-                    self.executor = executor
-                    self.user_id = user_id
-                    self.domain = domain
-                    self.document_id = document_id
-                    self.mood = mood
-                    self.history = history or []
-
-                def run(self, query: str) -> str:
-                    try:
-                        inputs = {
-                            "input": query,
-                            "user_id": self.user_id,
-                            "domain": self.domain,
-                            "document_id": self.document_id,
-                            "mood": self.mood,
-                            "history": self.history,
-                        }
-                        out = self.executor.run(inputs)
-                        return out if isinstance(out, str) else str(out)
-                    except Exception as e:
-                        logger.exception("LCAgent.run failed")
-                        return f"Agent error: {e}"
-
-            return LCAgent(executor, user_id, domain, document_id, default_mood, history)
-
-    
-    
-# ---------- Fallback: SIMPLE AGENT (RAG → Web → LLM fallback) ---------- #
 class SimpleAgent:
-    def __init__(self, user_id, domain, document_id, mood, history, agent_enabled=False):
+    """
+    1) Try RAG (local docs)
+    2) If agent_mode OFF = stop
+    3) If agent_mode ON => search Web
+    4) If still weak => Groq LLM reasoning fallback
+    """
+
+    def __init__(self, user_id, domain, document_id, mood, history, enabled=False):
         self.user_id = user_id
         self.domain = domain
         self.document_id = document_id
         self.mood = mood
         self.history = history or []
-        self.agent_enabled = agent_enabled  # ← KEY CHANGE
+        self.enabled = enabled    # 🔥 controls agent mode
 
     def run(self, query: str) -> str:
-        q = (query or "").strip()
-        if not q:
-            return "No query provided."
 
-        # ALWAYS FIRST → RAG lookup
-        rag_res = _rag_call(
-            q,
-            user_id=self.user_id,
-            domain=self.domain,
-            document_id=self.document_id,
-            mood=self.mood,
-            history=self.history,
-        )
-        if rag_res.get("validated"):
-            return rag_res["answer"]     # Found in your docs 🔥
-        
-        # ---- If agent is OFF — STOP HERE ----
-        if not self.agent_enabled:
-            return "No strong match found in your uploaded documents. (Agent mode is OFF)"
+        # Step 1 — RAG lookup
+        rag = _rag_call(query, self.user_id, self.domain, self.document_id, self.mood, self.history)
 
-        # ---- Agent Mode → Web + LLM fallback ----
-        web = _internet_search_raw(q)
-        if "No web results" not in web:
-            return f"{web}\n\n[Agent Mode - Web Result]"
+        if rag.get("validated"):  # hit document
+            return rag["answer"]
 
-        # LLM reasoning fallback
+        # Step 2 — If agent disabled STOP EARLY
+        if not self.enabled:
+            return "❗ No match in documents. Agent Mode disabled."
+
+        # Step 3 — Web search
+        web = _internet_search_raw(query)
+        if "No web" not in web:
+            return web + "\n\n🌐 Web Search Result (Agent Mode)"
+
+        # Step 4 — Groq LLM fallback
         try:
             from groq import Groq
-            client = Groq(api_key=os.getenv("GROQ_API_KEY"))
+            client = Groq(api_key=GROQ_API_KEY)
             out = client.chat.completions.create(
                 model=GROQ_MODEL,
                 messages=[
                     {"role": "system", "content": "Answer using external knowledge."},
-                    {"role": "user", "content": q},
-                ],
+                    {"role": "user", "content": query}
+                ]
             )
-            return out.choices[0].message.content + "\n\n[Agent LLM Fallback]"
+            return out.choices[0].message.content + "\n\n🧠 LLM Reasoning Fallback"
         except:
-            pass
+            return "❌ Agent could not answer."
 
-        return "No answer found — even Agent fallback failed."
+
+# ------------------------ REQUIRED FIX ------------------------- #
+
+def build_agent(user_id=None, domain=None, document_id=None,
+                mood="neutral", history=None, agent_enabled=False):
+    """
+    ALWAYS return SimpleAgent now. (Stable mode)
+    """
+    return SimpleAgent(
+        user_id=user_id,
+        domain=domain,
+        document_id=document_id,
+        mood=mood,
+        history=history,
+        enabled=agent_enabled
+    )

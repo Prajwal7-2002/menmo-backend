@@ -297,29 +297,23 @@ class ConversationChatAPIView(APIView):
         # ================== AGENT MODE ================== #
 # ================== AGENT MODE ================== #
         if agent_mode:
-            agent = build_agent(
-                user_id     = request.user.id,
-                domain      = domain,
-                document_id = document_id,
-                mood        = mood,
-                history     = memory,
-                agent_enabled = True      # 🔥 THIS IS THE KEY
-)
+                agent = build_agent(
+                    user_id=request.user.id,
+                    domain=domain,
+                    document_id=document_id,
+                    mood=mood,
+                    history=memory,
+                    agent_enabled=True
+                )
 
-
-            agent.agent_enabled = True      #  <<< REQUIRED 🔥🔥
-
-            try:
                 answer = agent.run(query)
-            except Exception as e:
-                answer = f"Agent error: {e}"
 
-            # Save messages + semantic memory
-            Message.objects.create(conversation=conv, role="user",       content=query)
-            Message.objects.create(conversation=conv, role="assistant",  content=answer)
-            store_conversation_turn(request.user, query, answer)
+                Message.objects.create(conversation=conv, role="user", content=query)
+                Message.objects.create(conversation=conv, role="assistant", content=answer)
+                store_conversation_turn(request.user, query, answer)
 
-            return Response({"answer": answer, "mode": "agent"}, status=200)
+                return Response({"answer": answer, "mode": "agent"})
+
 
 
         # ================== RAG MODE (DEFAULT) ================== #
