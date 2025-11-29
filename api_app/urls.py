@@ -8,7 +8,12 @@ from .views import (
     DocumentDeleteAPIView,
     SwitchDomainAPIView,
     AgentAskAPIView,
-    ChatHistoryAPIView
+    CreateConversationAPIView,
+    ConversationListAPIView,
+    ConversationChatAPIView,
+    ConversationHistoryAPIView,
+    RenameConversationAPIView,
+    DeleteConversationAPIView
 )
 
 urlpatterns = [
@@ -22,5 +27,11 @@ urlpatterns = [
     path("delete-document/<uuid:doc_id>/", DocumentDeleteAPIView.as_view(), name="delete_document"),
     path("switch-domain/", SwitchDomainAPIView.as_view(), name="switch_domain"),
     path("ask-agent/", AgentAskAPIView.as_view()),
-    path("history/", ChatHistoryAPIView.as_view()),
+    # 🧵 multi-chat
+    path("conversations/", CreateConversationAPIView.as_view(), name="create_conversation"),
+    path("conversations/list/", ConversationListAPIView.as_view(), name="list_conversations"),
+    path("conversations/<uuid:cid>/chat/", ConversationChatAPIView.as_view(), name="conversation_chat"),
+    path("conversations/<uuid:cid>/history/", ConversationHistoryAPIView.as_view(), name="conversation_history"),
+    path("conversations/<uuid:cid>/rename/", RenameConversationAPIView.as_view()),       # rename
+    path("conversations/<uuid:cid>/delete/", DeleteConversationAPIView.as_view()),       # delete
 ]

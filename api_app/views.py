@@ -4,27 +4,21 @@ import uuid
 import tempfile
 from pathlib import Path
 
-from rag.memory import (
-    load_buffer, prune_buffer, load_summary,
-    save_summary, summarize_history, load_user_preferences
-)
-from api_app.models import UserPreference, ConversationSummary
-
 from rest_framework.views import APIView
 from rest_framework.response import Response
 from rest_framework.permissions import IsAuthenticated
-
 from django.db.models import Avg, Count
 from django.utils import timezone
 
 from .serializers import AskSerializer, FeedbackSerializer
 from .models import QueryLog, Feedback
 from rag.models import UploadedDocument, ChunkFeedback, DocumentChunk
-
 from rag.pipeline import run_rag
 from rag.loader import index_document
 from rag.agent import build_agent
-from rag.memory import load_buffer
+from rag.memory import store_conversation_turn, load_vector_memory
+from api_app.models import Conversation, Message
+
 
 # ---------------------------------------------------------
 # ASK API
@@ -36,46 +30,28 @@ class AskAPIView(APIView):
         serializer = AskSerializer(data=request.data)
         serializer.is_valid(raise_exception=True)
 
+        user  = request.user
         query = serializer.validated_data["query"]
-        req_mood = request.data.get("mood")
-        provided_history = request.data.get("history", []) or []
+        mood  = request.data.get("mood", "neutral")
 
-        # ❌ REMOVE THIS LINE:
-        # from rag.models import QueryLog
+        # optional context
+        domain      = request.session.get("active_domain")
+        document_id = request.data.get("document_id")
 
-        prefs = load_user_preferences(request.user)
-        mood = req_mood or prefs.get("default_mood", "neutral")
-
-        buffer = load_buffer(request.user)
-        summary = load_summary(request.user)
-
-        final_history = []
-        if summary:
-            final_history.append({"role": "system", "content": f"Summary: {summary}"})
-        if buffer:
-            final_history.extend(buffer)
-        if provided_history:
-            final_history.extend(provided_history)
-        final_history = prune_buffer(final_history)
+        # 🧠 retrieve semantic memory from Pinecone
+        memory = load_vector_memory(user, query)
 
         result = run_rag(
-            query=query,
-            user_id=request.user.id,
-            domain=request.session.get("active_domain"),
-            document_id=request.data.get("document_id"),
-            mood=mood,
-            history=final_history,
+            query       = query,
+            user_id     = user.id,
+            domain      = domain,
+            document_id = document_id,
+            mood        = mood,
+            history     = memory,
         )
 
-        q = QueryLog.objects.create(
-            user=request.user,
-            query=query,
-            answer=result["answer"][:4000],
-            top_score=result["confidence"],
-            chunks=result.get("chunks", []),
-        )
-
-        result["query_id"] = str(q.id)
+        # 🔥 store new message + answer in vector DB
+        store_conversation_turn(user, query, result["answer"])
 
         return Response(result)
 
@@ -243,31 +219,21 @@ class AgentAskAPIView(APIView):
     permission_classes = [IsAuthenticated]
 
     def post(self, request):
-        query = request.data.get("query")
-        req_mood = request.data.get("mood")
-        provided_history = request.data.get("history", []) or []
+        user   = request.user
+        query  = request.data.get("query", "")
+        mood   = request.data.get("mood", "neutral")
+        domain = request.session.get("active_domain")
+        document_id = request.data.get("document_id")
 
-        prefs = load_user_preferences(request.user)
-        mood = req_mood or prefs.get("default_mood", "neutral")
-
-        buffer = load_buffer(request.user)
-        summary = load_summary(request.user)
-
-        final_history = []
-        if summary:
-            final_history.append({"role": "system", "content": f"Summary: {summary}"})
-        if buffer:
-            final_history.extend(buffer)
-        if provided_history:
-            final_history.extend(provided_history)
-        final_history = prune_buffer(final_history)
+        # 🧠 Get memory relevant to the query
+        memory = load_vector_memory(user, query)
 
         agent = build_agent(
-            user_id=request.user.id,
-            domain=request.session.get("active_domain"),
-            document_id=request.data.get("document_id"),
-            mood=mood,
-            history=final_history,
+            user_id     = user.id,
+            domain      = domain,
+            document_id = document_id,
+            mood        = mood,
+            history     = memory,   # ✅ build_agent expects history
         )
 
         try:
@@ -275,24 +241,104 @@ class AgentAskAPIView(APIView):
         except Exception as e:
             answer = f"Agent error: {e}"
 
-        QueryLog.objects.create(
-            id=uuid.uuid4(),
-            user=request.user,
-            query=query,
-            answer=answer[:4000],
-            top_score=1.0,
-            chunks=[],
-        )
+        # 🔥 Save conversation memory
+        store_conversation_turn(user, query, answer)
 
-        return Response({"answer": answer, "validated": True, "chunks": [], "agent_mode": True})
-    
+        return Response({"answer": answer, "agent_mode": True})
 
 
 
-class ChatHistoryAPIView(APIView):
+
+
+# CREATE CHAT SESSION
+class CreateConversationAPIView(APIView):
+    permission_classes=[IsAuthenticated]
+
+    def post(self, request):
+        conv = Conversation.objects.create(user=request.user)
+        return Response({"id": str(conv.id)}, status=201)
+
+
+# LIST ALL CONVERSATIONS
+class ConversationListAPIView(APIView):
     permission_classes=[IsAuthenticated]
 
     def get(self, request):
-        history = load_buffer(request.user)  # pulls last 10 messages
-        return Response({"history":history})
+        chats = Conversation.objects.filter(user=request.user).order_by("-updated_at")
+        return Response([
+            {"id": str(c.id), "title": c.title, "updated_at": c.updated_at}
+            for c in chats
+        ])
+
+
+# CHAT WITH VECTOR MEMORY (PER SESSION)
+class ConversationChatAPIView(APIView):
+    permission_classes=[IsAuthenticated]
+
+    def post(self, request, cid):
+        try:
+            conv = Conversation.objects.get(id=cid, user=request.user)
+        except:
+            return Response({"detail":"Conversation not found"}, status=404)
+
+        query = request.data.get("query","")
+        memory = load_vector_memory(request.user, query)
+
+        response = run_rag(query=query, user_id=request.user.id, history=memory)
+
+        # save message + vector memory
+        Message.objects.create(conversation=conv, role="user", content=query)
+        Message.objects.create(conversation=conv, role="assistant", content=response["answer"])
+        store_conversation_turn(request.user, query, response["answer"])
+
+        return Response(response)
+
+
+# GET CHAT HISTORY (NO BUFFER ANYMORE)
+class ConversationHistoryAPIView(APIView):
+    permission_classes=[IsAuthenticated]
+
+    def get(self, request, cid):
+        try:
+            conv = Conversation.objects.get(id=cid, user=request.user)
+        except:
+            return Response({"detail":"Conversation not found"}, status=404)
+
+        messages = conv.messages.order_by("timestamp")
+
+        return Response([
+            {"role":m.role,"content":m.content} for m in messages
+        ])
+    
+# RENAME CHAT TITLE
+class RenameConversationAPIView(APIView):
+    permission_classes=[IsAuthenticated]
+
+    def patch(self, request, cid):
+        try:
+            conv = Conversation.objects.get(id=cid, user=request.user)
+        except Conversation.DoesNotExist:
+            return Response({"detail":"Not found"}, status=404)
+
+        new_title = request.data.get("title", "").strip()
+        if not new_title:
+            return Response({"detail":"Title required"}, status=400)
+
+        conv.title = new_title
+        conv.save()
+        return Response({"detail":"Renamed successfully", "title":new_title})
+
+
+# DELETE A CHAT
+class DeleteConversationAPIView(APIView):
+    permission_classes=[IsAuthenticated]
+
+    def delete(self, request, cid):
+        try:
+            conv = Conversation.objects.get(id=cid, user=request.user)
+        except Conversation.DoesNotExist:
+            return Response({"detail":"Not found"}, status=404)
+
+        conv.delete()
+        return Response({"detail":"Conversation deleted"}, status=200)
 

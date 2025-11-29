@@ -1,3 +1,4 @@
+# api_app/models.py
 import uuid
 from django.db import models
 from django.conf import settings
@@ -50,3 +51,17 @@ class ConversationSummary(models.Model):
     summary = models.TextField()
     created_at = models.DateTimeField(auto_now_add=True)
     updated_at = models.DateTimeField(auto_now=True)
+
+class Conversation(models.Model):
+    id          = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    user        = models.ForeignKey(UserModel, on_delete=models.CASCADE, related_name="conversations")
+    title       = models.CharField(max_length=200, default="New Chat")
+    created_at  = models.DateTimeField(auto_now_add=True)
+    updated_at  = models.DateTimeField(auto_now=True)
+
+class Message(models.Model):
+    id            = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    conversation  = models.ForeignKey(Conversation, on_delete=models.CASCADE, related_name="messages")
+    role          = models.CharField(max_length=20, choices=[("user","user"),("assistant","assistant")])
+    content       = models.TextField()
+    timestamp     = models.DateTimeField(auto_now_add=True)
