@@ -273,25 +273,71 @@ class ConversationListAPIView(APIView):
 
 # CHAT WITH VECTOR MEMORY (PER SESSION)
 class ConversationChatAPIView(APIView):
-    permission_classes=[IsAuthenticated]
+    permission_classes = [IsAuthenticated]
 
     def post(self, request, cid):
         try:
             conv = Conversation.objects.get(id=cid, user=request.user)
-        except:
-            return Response({"detail":"Conversation not found"}, status=404)
+        except Conversation.DoesNotExist:
+            return Response({"detail": "Conversation not found"}, status=404)
 
-        query = request.data.get("query","")
+        query = (request.data.get("query") or "").strip()
+        if not query:
+            return Response({"detail": "Query is required"}, status=400)
+
+        # 🔥 Extra controls from frontend
+        agent_mode  = bool(request.data.get("agent_mode", False))
+        mood        = request.data.get("mood", "neutral")
+        document_id = request.data.get("document_id")
+        domain      = request.session.get("active_domain")
+
+        # 🧠 vector memory (Pinecone)
         memory = load_vector_memory(request.user, query)
 
-        response = run_rag(query=query, user_id=request.user.id, history=memory)
+        # ================== AGENT MODE ================== #
+        if agent_mode:
+            agent = build_agent(
+                user_id     = request.user.id,
+                domain      = domain,
+                document_id = document_id,
+                mood        = mood,
+                history     = memory,
+            )
+
+            try:
+                answer = agent.run(query)
+            except Exception as e:
+                answer = f"Agent error: {e}"
+
+            # Save messages + semantic memory
+            Message.objects.create(conversation=conv, role="user",       content=query)
+            Message.objects.create(conversation=conv, role="assistant",  content=answer)
+            store_conversation_turn(request.user, query, answer)
+
+            # No chunks/query_id here – frontend already handles missing fields
+            return Response({
+                "answer": answer,
+                "mode": "agent",
+            }, status=200)
+
+        # ================== RAG MODE (DEFAULT) ================== #
+        response = run_rag(
+            query       = query,
+            user_id     = request.user.id,
+            domain      = domain,
+            document_id = document_id,
+            mood        = mood,
+            history     = memory,
+        )
 
         # save message + vector memory
-        Message.objects.create(conversation=conv, role="user", content=query)
-        Message.objects.create(conversation=conv, role="assistant", content=response["answer"])
-        store_conversation_turn(request.user, query, response["answer"])
+        Message.objects.create(conversation=conv, role="user",      content=query)
+        Message.objects.create(conversation=conv, role="assistant", content=response.get("answer", ""))
 
-        return Response(response)
+        store_conversation_turn(request.user, query, response.get("answer", ""))
+
+        return Response(response, status=200)
+
 
 
 # GET CHAT HISTORY (NO BUFFER ANYMORE)

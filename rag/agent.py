@@ -137,25 +137,21 @@ else:
 
 
 # ---------------- Build Agent ---------------- #
+# ---------------- Build Agent ---------------- #
 
-def build_agent(user_id: int = None,
-                domain: Optional[str] = None,
-                document_id: Optional[str] = None,
-                mood: str = "neutral",
-                history: Optional[List[Dict[str, str]]] = None):
-    """Return an object with .run(query) – LangChain agent if available; fallback otherwise."""
-    # Load preferences if possible
-    try:
-        from django.contrib.auth import get_user_model
-        User = get_user_model()
-        user_obj = None
-        if user_id:
-            user_obj = User.objects.filter(id=user_id).first()
-        prefs = load_user_preferences(user_obj) if user_obj else {}
-    except Exception:
-        prefs = {}
-
-    default_mood = prefs.get("default_mood", mood)
+def build_agent(
+    user_id: int = None,
+    domain: Optional[str] = None,
+    document_id: Optional[str] = None,
+    mood: str = "neutral",
+    history: Optional[List[Dict[str, str]]] = None,
+):
+    """
+    Return an object with .run(query).
+    - If LangChain + Groq bindings are available → use ReAct agent with tools.
+    - Otherwise fall back to SimpleAgent (RAG + web + Groq fallback).
+    """
+    default_mood = mood or "neutral"
 
     # If we have LangChain & Groq bindings, use full agent
     if create_react_agent and AgentExecutor and ChatGroq and DuckDuckGoSearchAPIWrapper:
@@ -171,7 +167,11 @@ def build_agent(user_id: int = None,
         )
 
         try:
-            agent_chain = create_react_agent(llm=llm, tools=tools, system_message=system_instruction)
+            agent_chain = create_react_agent(
+                llm=llm,
+                tools=tools,
+                system_message=system_instruction,
+            )
             executor = AgentExecutor(agent_chain=agent_chain)
         except Exception as e:
             logger.exception("LangChain agent creation failed, falling back to SimpleAgent.")
@@ -205,7 +205,7 @@ def build_agent(user_id: int = None,
 
             return LCAgent(executor, user_id, domain, document_id, default_mood, history)
 
-    # Fallback: simple, non-LangChain agent
+    # ---------- Fallback: simple, non-LangChain agent ---------- #
     class SimpleAgent:
         def __init__(self, user_id, domain, document_id, mood, history):
             self.user_id = user_id
@@ -219,31 +219,43 @@ def build_agent(user_id: int = None,
             if not q:
                 return "No query provided."
 
-            # --- 1) Try RAG first always ---
-            rag_res = _rag_call(q, user_id=self.user_id, domain=self.domain,
-                                document_id=self.document_id, mood=self.mood, history=self.history)
-
-            if rag_res.get("validated"):
-                return rag_res.get("answer") or "No answer found in documents."
-
-            # --- 2) If RAG failed → try web ---
-            web = _internet_search_raw(q)
-
-            if "No web results" not in web:
-                return f"{web}\n\n(No strong evidence from documents, using web search.)"
-
-            # --- 3) If RAG + Web both fail → GENERIC LLM FALLBACK 🚀 ---
-            from groq import Groq
-            client = Groq(api_key=os.getenv("GROQ_API_KEY"))
-
             try:
-                completion = client.chat.completions.create(
-                    model=GROQ_MODEL,
-                    messages=[
-                        {"role": "system","content":"You are an intelligent copilot. Use reasoning."},
-                        {"role": "user","content": q}
-                    ]
+                # 1) RAG first
+                rag_res = _rag_call(
+                    q,
+                    user_id=self.user_id,
+                    domain=self.domain,
+                    document_id=self.document_id,
+                    mood=self.mood,
+                    history=self.history,
                 )
-                return completion.choices[0].message.content
-            except Exception:
-                return "I could not find the answer, even with fallback LLM."
+
+                if rag_res.get("validated"):
+                    return rag_res.get("answer") or "No answer found in documents."
+
+                # 2) Web search
+                web = _internet_search_raw(q)
+                if "No web results" not in web:
+                    return f"{web}\n\n(No strong evidence from documents, using web search.)"
+
+                # 3) Groq LLM fallback
+                from groq import Groq
+                client = Groq(api_key=os.getenv("GROQ_API_KEY"))
+
+                try:
+                    completion = client.chat.completions.create(
+                        model=GROQ_MODEL,
+                        messages=[
+                            {"role": "system", "content": "You are an intelligent copilot. Use reasoning."},
+                            {"role": "user", "content": q},
+                        ],
+                    )
+                    return completion.choices[0].message.content
+                except Exception:
+                    return "I could not find the answer, even with fallback LLM."
+
+            except Exception as e:
+                logger.exception("SimpleAgent.run failed")
+                return f"Agent error: {e}"
+
+    return SimpleAgent(user_id, domain, document_id, default_mood, history)
