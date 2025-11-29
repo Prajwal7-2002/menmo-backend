@@ -86,9 +86,10 @@ def run_rag(
     )
 
     return {
-        "answer": final,
-        "validated": True,
-        "confidence": top["score"],
-        "chunks": chosen,
-        "query_id": str(log.id)
+    "answer": final,
+    "validated": top["score"] >= LOW_CONF_THRESHOLD,   # 🔥 only valid when strong relevance
+    "confidence": top["score"],
+    "chunks": chosen,
+    "query_id": str(log.id)
     }
+

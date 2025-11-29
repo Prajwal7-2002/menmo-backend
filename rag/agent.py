@@ -3,14 +3,13 @@
 import os
 import logging
 from typing import List, Dict, Any, Optional
-from duckduckgo_search import DDGS
+from ddgs import DDGS
 from .pipeline import run_rag
 
 logger = logging.getLogger(__name__)
 
 GROQ_MODEL = os.getenv("GROQ_MODEL", "meta-llama/llama-4-maverick-17b-128e-instruct")
 GROQ_API_KEY = os.getenv("GROQ_API_KEY")
-
 
 # ----------------------- DuckDuckGo Search ---------------------- #
 
@@ -58,8 +57,9 @@ class SimpleAgent:
         # Step 1 — RAG lookup
         rag = _rag_call(query, self.user_id, self.domain, self.document_id, self.mood, self.history)
 
-        if rag.get("validated"):  # hit document
+        if rag.get("validated") and not self.enabled:   # only block local if agent off
             return rag["answer"]
+
 
         # Step 2 — If agent disabled STOP EARLY
         if not self.enabled:
