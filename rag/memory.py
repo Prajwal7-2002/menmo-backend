@@ -53,6 +53,7 @@ def load_vector_memory(user, query: str, top_k: int = 6) -> List[Dict[str, str]]
     Retrieves similar past messages based on semantic relevance.
     Returns chat-style history list used directly by RAG + Agent.
     """
+    
     try:
         from sentence_transformers import SentenceTransformer
         model = SentenceTransformer("all-MiniLM-L6-v2")
@@ -71,19 +72,63 @@ def load_vector_memory(user, query: str, top_k: int = 6) -> List[Dict[str, str]]
 
         messages = []
         for match in response.get("matches", []):
+    # score filter (VERY important)
+            if match.get("score", 0) < 0.40:
+                continue
+
             txt = match["metadata"]["text"]
 
-            # split into user + assistant
             if "\nassistant:" in txt:
                 u, a = txt.split("\nassistant:")
                 u = u.replace("user:", "").strip()
                 a = a.strip()
 
-                messages.append({"role":"user","content":u})
-                messages.append({"role":"assistant","content":a})
+                messages.append({"role": "user", "content": u})
+                messages.append({"role": "assistant", "content": a})
+
 
         return messages
 
     except Exception as e:
         print("❌ Failed retrieving conversation memory:", e)
+        return []
+
+
+# ==========================================================
+# 3️⃣  Agentic Memory Retrieval (Relevance Scored)
+# ==========================================================
+
+def relevant_chunks(user, query: str, top_k: int = 4):
+    """
+    Returns scored memory entries for agentic retrieval.
+    Does NOT replace load_vector_memory() — used only for scoring.
+    """
+    try:
+        from sentence_transformers import SentenceTransformer
+        model = SentenceTransformer("all-MiniLM-L6-v2")
+
+        query_vec = model.encode(query).tolist()
+
+        pc = Pinecone(api_key=PINECONE_API_KEY)
+        index = pc.Index(INDEX_NAME)
+
+        response = index.query(
+            vector=query_vec,
+            top_k=top_k,
+            include_metadata=True,
+            filter={"type": "conversation", "user": str(user.id)}
+        )
+
+        results = []
+        for m in response.get("matches", []):
+            results.append({
+                "text": m["metadata"]["text"],
+                "score": float(m.get("score", 0)),
+                "meta": m["metadata"]
+            })
+
+        return results
+
+    except Exception as e:
+        print("❌ relevant_chunks failed:", e)
         return []
