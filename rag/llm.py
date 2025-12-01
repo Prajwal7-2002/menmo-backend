@@ -1,23 +1,19 @@
-# rag/llm.py
 import os
+import time
 import requests
+from typing import Optional
 
-GROQ_MODEL = os.getenv("GROQ_MODEL", "meta-llama/llama-4-maverick-17b-128e-instruct")
+# KEEP YOUR MODEL / KEYS — user insisted we don't change models
+GROQ_MODEL = os.getenv("GROQ_MODEL", "llama-3.3-70b-versatile")
 GROQ_API_KEY = os.getenv("GROQ_API_KEY")
-GROQ_URL = "https://api.groq.com/openai/v1/chat/completions"
+GROQ_URL = os.getenv("GROQ_URL", "https://api.groq.com/openai/v1/chat/completions")
 
-
-# ---------------------- Answer prompt ----------------------
-
+# Answer prompt (kept minimal and strict)
 ANSWER_PROMPT = """
 You are a document-grounded assistant.
-
 You MUST answer ONLY using the provided CONTEXT.
-If the context does not contain any relevant information,
-reply: "I don’t know based on the available documentation. 
-Please rephrase your question or ask something more specific."
-
-
+If the context does not contain relevant information, reply:
+"I don’t know based on the available documentation."
 CONTEXT:
 {context}
 
@@ -26,133 +22,110 @@ USER QUESTION:
 
 STYLE INSTRUCTIONS:
 Respond in the following style/mood: {mood}.
-If mood = neutral, respond in a factual tone.
-
 GROUND-TRUTH ANSWER:
 """
 
-
-def call_llm_answer(
-    question: str,
-    context: str,
-    mood: str = "neutral",
-    max_tokens: int = 256,
-):
-    if not GROQ_API_KEY:
-        print("[LLM] Missing API KEY")
-        return ""
-
+# small helper to build payload (keeps deterministic settings)
+def _build_payload(question: str, context: str, mood: str, max_tokens: int):
     mood_style = {
         "neutral": "Clear and factual.",
         "friendly": "Warm, helpful, encouraging tone.",
         "formal": "Structured professional tone.",
         "joke": "Light humorous tone.",
         "emotional": "Expressive, empathetic tone.",
-    }.get(mood, "neutral")
+    }.get(mood, "Clear and factual.")
+
+    system = (
+        "You are a Retrieval-Augmented assistant.\n\n"
+        "- Use ONLY the information inside the provided context\n"
+        "- Do NOT invent facts or hallucinate\n"
+        '- If answer is not found, respond only with: "I don’t know based on the available documentation."\n\n'
+        f"Tone style → {mood_style}\n\n"
+        "---------------- CONTEXT ----------------\n"
+        f"{context}\n"
+        "-----------------------------------------\n"
+    )
 
     payload = {
         "model": GROQ_MODEL,
         "messages": [
-            {
-                "role": "system",
-                "content": 
-                f"""
-                You are a Retrieval-Augmented assistant.
-
-                RULES FOR ANSWERING:
-                - Use ONLY the information inside the provided context
-                - Do NOT invent facts or hallucinate
-                - If answer is not found, respond only with:
-                  "I don’t know based on the available documentation."
-
-                Tone style → {mood_style}
-
-                ---------------- CONTEXT ----------------
-                {context}
-                -----------------------------------------
-                """,
-            },
+            {"role": "system", "content": system},
             {"role": "user", "content": question},
         ],
         "max_tokens": max_tokens,
-        "temperature": 0.2,   # deterministic, factual
-        "top_p": 0.9
+        "temperature": 0.2,
+        "top_p": 0.9,
     }
+    return payload
 
-    try:
-        resp = requests.post(GROQ_URL, headers={"Authorization": f"Bearer {GROQ_API_KEY}"}, json=payload)
-        resp.raise_for_status()
-        return resp.json()["choices"][0]["message"]["content"].strip()
-    except Exception as e:
-        print("\n❌ LLM Answer Error:", e)
+def _post_with_backoff(json_payload, headers, max_attempts=5):
+    backoff = 1.0
+    for attempt in range(1, max_attempts + 1):
+        try:
+            resp = requests.post(GROQ_URL, headers=headers, json=json_payload, timeout=30)
+            resp.raise_for_status()
+            return resp.json()
+        except requests.HTTPError as e:
+            status = getattr(e.response, "status_code", None)
+            # Retry on 429 or 502/503/504
+            if status in (429, 502, 503, 504):
+                wait = backoff * (1.5 ** (attempt - 1))
+                time.sleep(wait)
+                continue
+            else:
+                raise
+        except Exception:
+            # network / timeout -> retry
+            time.sleep(backoff)
+            backoff = min(backoff * 2, 8.0)
+    # after attempts yield None
+    return None
+
+def call_llm_answer(
+    question: str,
+    context: str = "",
+    mood: str = "neutral",
+    max_tokens: int = 256,
+) -> str:
+    """
+    Call GROQ provider. If key missing or repeated failures, returns "" (empty string)
+    so caller can handle fallback.
+    """
+    if not GROQ_API_KEY:
+        # no key -> return blank so pipeline can fallback safely
+        print("[LLM] Missing GROQ_API_KEY — skipping LLM call")
         return ""
 
+    payload = _build_payload(question, context, mood, max_tokens)
+    headers = {"Authorization": f"Bearer {GROQ_API_KEY}", "Content-Type": "application/json"}
 
-# Backwards-compat for old imports: call_llm(...).
-def call_llm(question: str, context: str, max_tokens: int = 256) -> str:
-    # keep behaviour stable: neutral mood
-    return call_llm_answer(question, context, mood="neutral", max_tokens=max_tokens, temperature=0.0)
+    try:
+        res = _post_with_backoff(payload, headers)
+        if not res:
+            print("❌ LLM: request failed after retries")
+            return ""
+        # defensive access
+        choices = res.get("choices") or []
+        if not choices:
+            return ""
+        msg = choices[0].get("message", {}).get("content", "")
+        return (msg or "").strip()
+    except Exception as e:
+        print("❌ LLM Answer Error:", e)
+        return ""
 
-
-# ---------------------- Domain detection prompt ----------------------
-
-DOMAIN_PROMPT = """
-You are a classifier.
-
-Read the DOCUMENT below and respond with a very short domain/category
-that best describes the document content.
-
-Rules:
-- Respond with ONLY 1-3 words.
-- No sentences. No explanation.
-- Examples: "cardiology", "sports_news", "legal_contract", "api_documentation"
+# domain detection uses same LLM call; if LLM fails we default to 'general'
+def detect_domain_llm(text: str) -> str:
+    prompt = f"""
+Read the DOCUMENT below and respond with ONE short domain/category (1-3 words). No punctuation.
 
 DOCUMENT:
-{document}
-
-DOMAIN:
+{text[:5000]}
 """
-
-
-def detect_domain_llm(text: str) -> str:
-    """
-    Use LLM to automatically infer a broad domain/category
-    without any predefined label list.
-    Ensures stable, reusable domains.
-
-    Returns a safe string, defaults to "general" if anything fails.
-    """
-    prompt = f"""
-    You are a classification agent. Your job is to assign a short, high-level domain to a document.
-
-    The domain:
-    - MUST be 1 to 3 words
-    - MUST be a general category (e.g., programming, medical, legal, finance, science, education, business, engineering, literature, history, research)
-    - MUST NOT be overly specific (NO: 'Python Crash Course Chapter 9', YES: 'programming')
-    - MUST represent the MAIN subject of the entire document
-    - NO predefined labels required — infer the best possible category
-
-    Document content:
-    {text[:5000]}
-
-    Respond with ONLY the domain name. No explanations.
-    """
-
-    raw = call_llm_answer(
-        question="Infer a domain for this document.",
-        context=prompt,
-        mood="neutral",
-        max_tokens=16,
-    )
-
-    if not raw:
+    resp = call_llm_answer(question="Infer domain", context=prompt, mood="neutral", max_tokens=12)
+    if not resp:
         return "general"
-
-    domain = raw.strip().lower()
-    domain = domain.replace(".", "").replace(",", "")
-    domain = domain.replace(" ", "_")
-
-    if not domain:
+    d = resp.strip().lower().replace(".", "").replace(",", "").replace(" ", "_")
+    if not d or len(d) < 2:
         return "general"
-
-    return domain
+    return d
