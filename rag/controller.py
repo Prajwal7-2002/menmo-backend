@@ -251,7 +251,11 @@ def agentic_answer(
         })
 
     return {
-        "answer": final_answer or "",
-        "trace": working_trace,
-        "steps": len(working_trace)
-    }
+    "answer": final_answer or "",
+    "mode": "agent",
+    "confidence": 1.0,
+    "chunks": [],
+    "trace": working_trace,
+    "steps": len(working_trace)
+}
+
