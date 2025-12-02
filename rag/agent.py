@@ -4,6 +4,8 @@ from typing import Dict, Any
 import logging
 
 from rag.tools.langchain_tools import WrappedLLM, get_langchain_tools
+from langchain_core.prompts import PromptTemplate
+
 
 
 logger = logging.getLogger(__name__)
