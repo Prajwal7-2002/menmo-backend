@@ -27,8 +27,10 @@ def rewrite_query_tool(query: str, context_chunks: Optional[List[Dict[str, Any]]
             prompt += f"Context from documents:\n{context}\n\n"
 
         out = call_llm_answer(question=prompt, context="", mood="serious", max_tokens=max_tokens)
-        if out and isinstance(out, str) and out.strip():
-            return out.strip()
+        if out and isinstance(out, str):
+            out = out.strip()
+            if 1 < len(out) < 200:
+                return out
         return query
     except Exception as e:
         logger.exception("rewrite_query_tool failed: %s", e)

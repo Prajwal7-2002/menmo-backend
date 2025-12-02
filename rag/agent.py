@@ -1,3 +1,4 @@
+# agent.py
 from typing import Optional
 from .controller import agentic_answer
 
@@ -11,13 +12,14 @@ class SimpleAgent:
         self.enabled = enabled
 
     def run(self, query: str):
+        # increase max_steps so planner can rewrite -> retrieve -> refine in multiple steps
         return agentic_answer(
             query=query,
             user_id=self.user_id,
             domain=self.domain,
             document_id=self.document_id,
             user=None,
-            max_steps=4
+            max_steps=8
         )
 
 def build_agent(user_id=None, domain=None, document_id=None, mood="neutral", history=None, agent_enabled=False):

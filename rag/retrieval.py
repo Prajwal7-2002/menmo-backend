@@ -1,3 +1,4 @@
+# retrieval.py
 import os
 import logging
 from typing import List, Dict, Any, Optional
@@ -23,7 +24,7 @@ TOP_K_DEFAULT = int(os.getenv("RAG_TOP_K", "8"))
 
 # Hybrid weight defaults (change via env to tune)
 DENSE_WEIGHT = float(os.getenv("RAG_WEIGHT_DENSE", "0.45"))
-BM25_WEIGHT  = float(os.getenv("RAG_WEIGHT_BM25", "0.30"))
+BM25_WEIGHT  = float(os.getenv("RAG_WEIGHT_BM25", "0.35"))   # slightly increased relative weight
 RR_WEIGHT    = float(os.getenv("RAG_WEIGHT_RERANK", "0.15"))
 FB_WEIGHT    = float(os.getenv("RAG_WEIGHT_FEEDBACK", "0.10"))
 
@@ -33,9 +34,9 @@ USE_QUERY_REWRITE = str(os.getenv("USE_QUERY_REWRITE", "false")).lower() in ("1"
 
 RERANKER_MODEL = os.getenv("RERANKER_MODEL", "cross-encoder/ms-marco-MiniLM-L6-v2")
 
-# Minimum hybrid score and text length
-MIN_HYBRID_CONF = float(os.getenv("MIN_HYBRID_CONF", "0.60"))
-MIN_TEXT_LEN = int(os.getenv("MIN_TEXT_LEN", "40"))
+# Minimum hybrid score and text length — made friendlier for small docs
+MIN_HYBRID_CONF = float(os.getenv("MIN_HYBRID_CONF", "0.35"))
+MIN_TEXT_LEN = int(os.getenv("MIN_TEXT_LEN", "20"))
 
 _embedder = None
 _reranker = None
@@ -87,6 +88,7 @@ def query_vectors(query_text: str, user_id: Optional[int]=None, domain: Optional
         return []
     flt: Dict[str, Any] = {}
     if user_id is not None:
+        # ensure pinecone metadata filter uses string type (most insert workflows use str)
         flt["user_id"] = str(user_id)
     if domain:
         flt["domain"] = domain
@@ -227,6 +229,9 @@ def retrieve(query: str, user_id: Optional[int]=None, domain: Optional[str]=None
         })
 
     combined.sort(key=lambda x: x["score"], reverse=True)
+
+    logger.debug("retrieve: top combined scores: %s", ", ".join(f"{round(x['score'],3)}" for x in combined[:6]))
+
     return combined[:top_k]
 
 def upsert_vectors(items: List[Dict[str, Any]], batch_size: int = 100):

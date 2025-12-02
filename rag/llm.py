@@ -82,50 +82,109 @@ def _post_with_backoff(json_payload, headers, max_attempts=5):
     return None
 
 def call_llm_answer(
-    question: str,
+    question: str = None,
     context: str = "",
     mood: str = "neutral",
     max_tokens: int = 256,
+    messages: list = None
 ) -> str:
     """
-    Call GROQ provider. If key missing or repeated failures, returns "" (empty string)
-    so caller can handle fallback.
+    Unified LLM wrapper.
+
+    Supports:
+    - messages=[...]  (Agent mode)
+    - question/context (RAG mode)
+
+    Falls back safely to "" if call fails.
     """
+
     if not GROQ_API_KEY:
-        # no key -> return blank so pipeline can fallback safely
         print("[LLM] Missing GROQ_API_KEY — skipping LLM call")
         return ""
 
+    headers = {
+        "Authorization": f"Bearer {GROQ_API_KEY}",
+        "Content-Type": "application/json",
+    }
+
+    # =====================================================
+    # 1) AGENT MODE (messages list)
+    # =====================================================
+    if messages is not None:
+        payload = {
+            "model": GROQ_MODEL,
+            "messages": messages,
+            "max_tokens": max_tokens,
+        }
+
+        try:
+            res = _post_with_backoff(payload, headers)
+            if not res:
+                return ""
+            choices = res.get("choices") or []
+            if not choices:
+                return ""
+            return choices[0].get("message", {}).get("content", "").strip()
+        except Exception as e:
+            print("❌ LLM messages error:", e)
+            return ""
+
+    # =====================================================
+    # 2) RAG MODE (existing behavior preserved)
+    # =====================================================
     payload = _build_payload(question, context, mood, max_tokens)
-    headers = {"Authorization": f"Bearer {GROQ_API_KEY}", "Content-Type": "application/json"}
 
     try:
         res = _post_with_backoff(payload, headers)
         if not res:
             print("❌ LLM: request failed after retries")
             return ""
-        # defensive access
+
         choices = res.get("choices") or []
         if not choices:
             return ""
-        msg = choices[0].get("message", {}).get("content", "")
-        return (msg or "").strip()
+
+        return choices[0].get("message", {}).get("content", "").strip()
+
     except Exception as e:
         print("❌ LLM Answer Error:", e)
         return ""
 
-# domain detection uses same LLM call; if LLM fails we default to 'general'
+# ---------------------------------------------------------------------
+# Domain Detection Helper (used by loader.py)
+# ---------------------------------------------------------------------
 def detect_domain_llm(text: str) -> str:
+    """
+    Uses the LLM to infer the domain of a document.
+    Fallback = 'general'
+    """
     prompt = f"""
-Read the DOCUMENT below and respond with ONE short domain/category (1-3 words). No punctuation.
+Read the DOCUMENT below and respond with ONE short domain/category (1-3 words). 
+No punctuation.
 
 DOCUMENT:
 {text[:5000]}
 """
-    resp = call_llm_answer(question="Infer domain", context=prompt, mood="neutral", max_tokens=12)
+
+    resp = call_llm_answer(
+        question="Infer domain",
+        context=prompt,
+        mood="neutral",
+        max_tokens=12,
+    )
+
     if not resp:
         return "general"
-    d = resp.strip().lower().replace(".", "").replace(",", "").replace(" ", "_")
+
+    d = (
+        resp.strip()
+        .lower()
+        .replace(".", "")
+        .replace(",", "")
+        .replace(" ", "_")
+    )
+
     if not d or len(d) < 2:
         return "general"
+
     return d

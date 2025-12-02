@@ -1,62 +1,83 @@
 # rag/tools/intent_classifier.py
+import json
 from typing import Dict, Any
 from rag.llm import call_llm_answer
 
 SYSTEM_PROMPT = """
-You are a routing assistant. Given a user's raw query, decide whether the query should be:
-- handled_by_rag (answer from uploaded documents)
-- handled_by_chat (casual conversation / greeting / smalltalk)
-- handled_by_web (needs web / world knowledge)
-- handled_by_agent (complex, needs multi-step agent planning)
-- handled_by_fallback (unanswerable from docs/web, use LLM)
+Classify the user's intent into ONE of the following options (choose the single best match):
 
-Return JSON ONLY with these fields:
+1. "chat"           → casual conversation or greetings.
+2. "doc"            → question explicitly about an uploaded document (e.g. "in this document", "chapter 3").
+3. "knowledge"      → general factual or topical knowledge queries (no docs requested).
+4. "agent"          → needs agent behaviour (web, multiple tools, step-by-step reasoning).
+5. "memory_store"   → the user asks the assistant to remember or store a fact (e.g. "remember that...", "note that...").
+6. "memory_recall"  → the user asks the assistant to recall previously stored memories (e.g. "what did I tell you about X?", "what is my project about?").
+7. "fallback"       → none of the above, low confidence.
+
+Return STRICT JSON only, with these fields:
 {
-  "intent": "<one of the labels above>",
-  "confidence": <float between 0.0 and 1.0>,
-  "note": "<optional short reason, 10-25 words>"
+  "intent": "<chat|doc|knowledge|agent|memory_store|memory_recall|fallback>",
+  "confidence": 0.0,
+  "note": "<short reason>"
 }
-
-Be concise. Prefer document-handling when the user mentions document-specific items (file names, page numbers, 'in this document'), otherwise judge conservatively.
 """
+
+FALLBACK_DEFAULT = {"intent": "agent", "confidence": 0.5, "note": "llm failed or unclear"}
 
 def classify_intent_and_route(query: str) -> Dict[str, Any]:
     """
-    Uses an LLM to suggest routing. This avoids brittle rule lists in code.
-    Returns dict with keys: intent, confidence, note
+    Classify intent using the LLM. Robust to LLM mis-formatting.
+    If LLM fails or returns invalid content, fallback to simple heuristics.
     """
     if not query or not query.strip():
-        return {"intent": "handled_by_chat", "confidence": 0.95, "note": "empty or whitespace"}
+        return {"intent": "chat", "confidence": 0.95, "note": "empty or whitespace"}
+
+    # Quick heuristic overrides for clear memory store phrases (fast path)
+    qlow = query.strip().lower()
+    if qlow.startswith(("remember ", "remember that ", "note that ", "store " , "please remember ")):
+        return {"intent": "memory_store", "confidence": 0.95, "note": "heuristic: explicit remember/store phrase"}
+    if any(kw in qlow for kw in ("what did i", "what was i", "what is my project", "do i have", "what did we discuss", "what does my project", "what have i")):
+        return {"intent": "memory_recall", "confidence": 0.9, "note": "heuristic: recall question"}
 
     try:
         raw = call_llm_answer(
-            question=query,
+            question=f"Classify this query and return JSON: {query}",
             context=SYSTEM_PROMPT,
             mood="neutral",
-            max_tokens=60
+            max_tokens=120
         )
-        if not raw:
-            return {"intent": "handled_by_agent", "confidence": 0.4, "note": "no model output"}
-        raw = raw.strip()
-        # try to parse JSON if model returned JSON; otherwise attempt to extract simple tokens
-        import json
+
+        if not raw or not isinstance(raw, str):
+            return FALLBACK_DEFAULT
+
+        # Attempt to parse JSON from the LLM output robustly
+        parsed = None
         try:
-            j = json.loads(raw)
-            intent = j.get("intent", "").strip()
-            confidence = float(j.get("confidence", 0.0))
-            note = j.get("note", "")
-            if intent:
-                return {"intent": intent, "confidence": min(max(confidence, 0.0), 1.0), "note": note}
+            parsed = json.loads(raw)
         except Exception:
-            # fallback: very simple heuristic parse
-            txt = raw.lower()
-            if "rag" in txt or "document" in txt or "file" in txt or "in the doc" in txt:
-                return {"intent": "handled_by_rag", "confidence": 0.6, "note": "mentions document-like terms"}
-            if "hi" in txt or "hello" in txt or "how are you" in txt:
-                return {"intent": "handled_by_chat", "confidence": 0.95, "note": "greeting detected"}
-            if "web" in txt or "latest" in txt or "how many people" in txt or "population" in txt:
-                return {"intent": "handled_by_web", "confidence": 0.7, "note": "likely needs web"}
-            # default
-            return {"intent": "handled_by_agent", "confidence": 0.45, "note": "default conservative route"}
+            # Try to locate a JSON substring
+            s = raw
+            start = s.find("{")
+            end = s.rfind("}") + 1
+            if start != -1 and end != -1 and end > start:
+                try:
+                    parsed = json.loads(s[start:end])
+                except Exception:
+                    parsed = None
+
+        if isinstance(parsed, dict):
+            intent = parsed.get("intent", "").strip()
+            try:
+                conf = float(parsed.get("confidence", 0.5))
+            except Exception:
+                conf = 0.5
+            note = parsed.get("note", "") or parsed.get("explanation", "")
+
+            if intent in ("chat", "doc", "knowledge", "agent", "memory_store", "memory_recall", "fallback"):
+                return {"intent": intent, "confidence": max(0.0, min(1.0, conf)), "note": note}
+
     except Exception:
-        return {"intent": "handled_by_agent", "confidence": 0.3, "note": "intent classifier failed"}
+        pass
+
+    # Last resort: safe fallback
+    return FALLBACK_DEFAULT
