@@ -1,37 +1,65 @@
-# rag/tools/fallback_llm.py  (updated)
+# rag/tools/fallback_llm.py (SAFE & CLEAN VERSION)
 from rag.llm import call_llm_answer
 
 def fallback_llm_tool(query: str, context: str = "") -> str:
     """
-    General-purpose fallback that can summarize memory or answer generic queries.
-    If context contains memory entries, produce a concise factual answer that uses
-    the memory as evidence. Otherwise, answer normally.
+    A very safe fallback that ALWAYS returns a clean, short text answer.
+    Used when planner cannot pick a valid tool or when memory needs summarization.
     """
-    # If context appears to be memory entries, instruct the model to summarize them
-    mem_hint = ""
-    if context and ("user:" in context or "MEMORY" in context or "memory" in context.lower()):
-        mem_hint = (
-            "Context appears to contain the user's stored memories or past conversation. "
-            "When answering, use these memories as evidence. Produce a single concise sentence or two that directly answers "
-            "the user's question. If memory contradicts itself, point out the contradiction briefly."
+
+    # ---- 1. Detect memory context more reliably ----
+    is_memory = False
+    if context:
+        lowered = context.lower()
+        if any(k in lowered for k in ["memory", "fact:", "stored", "recall"]):
+            is_memory = True
+
+    # ---- 2. Build minimal prompt (VERY IMPORTANT) ----
+    if is_memory:
+        system_instruction = (
+            "You are summarizing the user's stored memories. "
+            "Return ONE short sentence using those memories as evidence. "
+            "Do not hallucinate. If unsure, say: 'I don't know based on the memory.'"
         )
     else:
-        mem_hint = "Context does not appear to contain stored memories. Answer the user query directly."
+        system_instruction = (
+            "Provide a short, helpful answer. "
+            "If the user greets you (hi, hello, hey), respond naturally. "
+            "Never answer with an empty string. "
+            "If unsure, say: 'I'm not sure, but I can help if you clarify.'"
+        )
 
-    full_context = (
-        f"{mem_hint}\n\nMemory/Context:\n{context}\n\n"
-        "Guidelines:\n"
-        "- Return a short, clear answer (1-2 sentences) for memory recall.\n"
-        "- If the user greets (hi/hello/hey), reply with a natural greeting.\n"
-        "- If the question is about factual knowledge and context is empty, answer normally.\n"
-        "- If you are unsure, say 'I don't know' only when necessary.\n"
-    )
+    # ---- 3. Build context ----
+    compact_context = f"{system_instruction}\n\nContext:\n{context or 'None'}"
 
-    response = call_llm_answer(
-        question=query,
-        context=full_context,
-        mood="friendly",
-        max_tokens=180
-    )
+    # ---- 4. Try generating ----
+    try:
+        result = call_llm_answer(
+            question=query,
+            context=compact_context,
+            mood="friendly",
+            max_tokens=100
+        )
+    except Exception:
+        return "I'm here to help — can you clarify that?"
 
-    return response.strip() if response else "I'm here!"
+    # ---- 5. Clean & normalize output ----
+    if not result or not str(result).strip():
+        return "I'm here to help — can you rephrase that?"
+
+    # strip weird characters or whitespace
+    text = str(result).strip()
+
+    # remove stray JSON formatting or quotes
+    if text.startswith("{") or text.startswith("["):
+        try:
+            import json
+            parsed = json.loads(text)
+            if isinstance(parsed, dict):
+                text = parsed.get("answer") or parsed.get("message") or str(parsed)
+            else:
+                text = str(parsed)
+        except Exception:
+            pass  # fallback to text
+
+    return text
