@@ -161,9 +161,33 @@ def agentic_answer(
         logger.debug("Planner chose action=%s payload=%s", action, payload)
 
         # FINISH action: planner gives final answer
+                # FINISH
         if action == "finish":
             final_answer = payload.get("answer") or payload.get("message") or ""
             working_trace.append({"step": step, "tool": "finish", "result": final_answer})
+
+            # If planner finished but answer is empty or a generic "no docs" message,
+            # automatically try web search + summarize as a best-effort fallback.
+            try:
+                low = (final_answer or "").strip().lower()
+                generic_no_doc = "don" in low and "know" in low and "document" in low  # loose check
+                if (not final_answer or not final_answer.strip()) or generic_no_doc:
+                    # run web search
+                    web_results = web_search_tool(query)
+                    working_trace.append({"step": step, "tool": "web_search", "result": web_results})
+
+                    # summarize web results using fallback LLM
+                    summary = fallback_llm_tool(
+                        query="Provide a short factual answer to the user's question using the web search results:",
+                        context=json.dumps(web_results, indent=2)
+                    )
+
+                    if isinstance(summary, str) and summary.strip():
+                        final_answer = summary
+                        working_trace.append({"step": step, "tool": "web_summary", "result": final_answer})
+            except Exception as e:
+                logger.exception("Automatic web fallback failed: %s", e)
+
             break
 
         # RAG action
