@@ -12,7 +12,7 @@ logger = logging.getLogger(__name__)
 
 try:
     from langchain.agents import create_react_agent, AgentExecutor
-    from langchain.prompts import PromptTemplate
+    
     LANGCHAIN_AVAILABLE = True
 except Exception:
     LANGCHAIN_AVAILABLE = False
