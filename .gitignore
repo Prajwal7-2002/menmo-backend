@@ -30,3 +30,6 @@ Thumbs.db
 .env
 .environments
 .ENV
+
+
+api_app/management/commands/test_agent.py

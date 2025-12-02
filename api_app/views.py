@@ -1,10 +1,11 @@
-# views.py — Fully Patched & Crash-Proof Version
+# rag/views.py (FINAL patched version — uses new agent, no controller references)
 
 import os
 import json
 import uuid
 import tempfile
 from pathlib import Path
+from typing import Any, Dict
 
 from django.db.models import Avg, Count
 from django.utils import timezone
@@ -24,161 +25,129 @@ from rag.agent import build_agent
 from rag.memory import (
     store_conversation_turn,
     load_vector_memory,
-    add_memory_fact
+    add_memory_fact,
+    relevant_chunks
 )
 
 from api_app.models import Conversation, Message
 from rag.tools.intent_classifier import classify_intent_and_route
 from rag.llm import call_llm_answer
-from rag.controller import agentic_answer
 
 
-# ================================================================
-# SAFETY WRAPPER — PREVENT FRONTEND CRASH BY ENSURING STRING OUTPUT
-# ================================================================
-def safe_text(value):
+# ------------------------
+# Small helpers
+# ------------------------
+def safe_text(value: Any) -> str:
     if value is None:
         return ""
     if isinstance(value, (dict, list)):
-        return json.dumps(value, ensure_ascii=False)
+        try:
+            return json.dumps(value)
+        except Exception:
+            return str(value)
     return str(value)
 
-
-# =====================================================================
-# ASK API — RAG + AGENT + CHAT + MEMORY STORE + MEMORY RECALL
-# =====================================================================
+def normalize_agent_output(agent_output: Any) -> Dict[str, Any]:
+    if agent_output is None:
+        return {"answer": "", "mode": "agent", "confidence": 0.0, "chunks": [], "trace": [], "steps": 0}
+    if isinstance(agent_output, str):
+        return {"answer": agent_output, "mode": "agent", "confidence": 1.0, "chunks": [], "trace": [], "steps": 1}
+    if isinstance(agent_output, dict):
+        return {
+            "answer": safe_text(agent_output.get("answer") or agent_output.get("output") or agent_output.get("text") or ""),
+            "mode": agent_output.get("mode", "agent"),
+            "confidence": float(agent_output.get("confidence", 1.0)),
+            "chunks": agent_output.get("chunks", []) or [],
+            "trace": agent_output.get("trace", []) or [],
+            "steps": int(agent_output.get("steps", len(agent_output.get("trace", []) or [])))
+        }
+    return {"answer": str(agent_output), "mode": "agent", "confidence": 1.0, "chunks": [], "trace": [], "steps": 1}
 
 class AskAPIView(APIView):
     permission_classes = [IsAuthenticated]
-
     def post(self, request):
         serializer = AskSerializer(data=request.data)
         serializer.is_valid(raise_exception=True)
-
         user = request.user
         query = serializer.validated_data["query"].strip()
-
         mood = request.data.get("mood", "neutral")
         domain = request.session.get("active_domain")
         document_id = request.data.get("document_id")
         memory = load_vector_memory(user, query)
-
         route = classify_intent_and_route(query)
         intent = route["intent"]
         intent_conf = route["confidence"]
 
-        force_doc_flag = bool(request.data.get("force_doc"))
-        document_mention = any(
-            key in query.lower() for key in
-            ("in the document", "in this document", "in the pdf", "page", "section", "chapter")
-        )
-
-        if document_id and (force_doc_flag or document_mention):
+        if document_id:
             intent = "doc"
 
-        # --------------------------- MEMORY STORE ---------------------------
         if intent == "memory_store":
             content = query
-            low = content.lower()
-
+            low = content.strip().lower()
             for pref in ("remember that", "remember", "note that", "please remember", "store"):
                 if low.startswith(pref):
                     content = content[len(pref):].strip()
                     break
-
-            content = content or query
-
-            stored = add_memory_fact(user=user, text=content)
-
+            if not content:
+                content = query
+            stored = False
+            try:
+                stored = add_memory_fact(user=user, text=content)
+            except Exception:
+                try:
+                    store_conversation_turn(user, f"[MEMORY] {content}", "")
+                    stored = True
+                except Exception:
+                    stored = False
             QueryLog.objects.create(user=user, query=query, top_score=0.0, chunks=[])
-
             if stored:
                 return Response({"answer": "Okay — I will remember that.", "mode": "memory_store", "confidence": intent_conf})
-            else:
-                return Response({"answer": "I tried to save that memory but ran into an issue.", "mode": "memory_store"}, status=500)
+            return Response({"answer": "I tried to save that memory but ran into an issue.", "mode": "memory_store", "confidence": 0.0}, status=500)
 
-        # --------------------------- MEMORY RECALL ---------------------------
         if intent == "memory_recall":
-            agent_res = agentic_answer(query, user.id, domain, document_id, user=user)
-            final_text = safe_text(agent_res.get("answer"))
-
+            agent = build_agent(user_id=user.id, domain=domain, document_id=document_id, mood=mood, history=memory, agent_enabled=True)
+            agent_raw = agent.run(query)
+            agent_res = normalize_agent_output(agent_raw)
+            final_text = safe_text(agent_res["answer"])
             store_conversation_turn(user, query, final_text)
+            return Response({"answer": final_text, "mode": "agent_memory", "confidence": intent_conf, "chunks": agent_res.get("chunks", []), "trace": agent_res.get("trace", [])})
 
-            return Response({
-                "answer": final_text,
-                "mode": "agent_memory",
-                "confidence": intent_conf,
-                "chunks": [],
-                "trace": agent_res.get("trace", [])
-            })
-
-        # ------------------------------- CHAT MODE ---------------------------
         if intent == "chat":
             answer = call_llm_answer(question=query, context="Casual conversation.", mood=mood, max_tokens=60)
-            answer = safe_text(answer)
-
             store_conversation_turn(user, query, answer)
+            QueryLog.objects.create(user=user, query=query, top_score=0.0, chunks=[])
             return Response({"answer": answer, "mode": "chat", "confidence": intent_conf, "chunks": []})
 
-        # ----------------------------- DOCUMENT MODE ------------------------
         if intent == "doc":
             rag_res = run_rag(query, user.id, domain, document_id, mood, memory)
             if rag_res.get("validated"):
-                store_conversation_turn(user, query, safe_text(rag_res["answer"]))
+                store_conversation_turn(user, query, rag_res["answer"])
+                QueryLog.objects.create(user=user, query=query, top_score=rag_res.get("top_score", 0.0), chunks=rag_res.get("chunks", []))
                 return Response({**rag_res, "mode": "rag"})
+            agent = build_agent(user_id=user.id, domain=domain, document_id=document_id, mood=mood, history=memory, agent_enabled=True)
+            agent_raw = agent.run(query)
+            agent_res = normalize_agent_output(agent_raw)
+            store_conversation_turn(user, query, safe_text(agent_res["answer"]))
+            QueryLog.objects.create(user=user, query=query, top_score=rag_res.get("top_score", 0.0), chunks=rag_res.get("chunks", []))
+            return Response({"answer": agent_res["answer"], "mode": "agent_fallback", "chunks": rag_res.get("chunks", []), "confidence": float(rag_res.get("confidence", 0)), "trace": agent_res.get("trace", [])})
 
-            agent_res = agentic_answer(query, user.id, domain, document_id, user=user)
-            final_text = safe_text(agent_res.get("answer"))
-
-            store_conversation_turn(user, query, final_text)
-
-            return Response({
-                "answer": final_text,
-                "mode": "agent_fallback",
-                "confidence": float(rag_res.get("confidence", 0)),
-                "chunks": rag_res.get("chunks", []),
-                "trace": agent_res.get("trace", [])
-            })
-
-        # --------------------------- KNOWLEDGE MODE -------------------------
-        if intent == "knowledge":
-            agent_res = agentic_answer(query, user.id, domain, document_id, user=user)
-            final_text = safe_text(agent_res.get("answer"))
-
-            store_conversation_turn(user, query, final_text)
-
-            return Response({
-                "answer": final_text,
-                "mode": "agent",
-                "confidence": intent_conf,
-                "chunks": [],
-                "trace": agent_res.get("trace", [])
-            })
-
-        # ---------------------------- DEFAULT MODE --------------------------
+        # default RAG-first
         rag_res = run_rag(query, user.id, domain, document_id, mood, memory)
         if rag_res.get("validated"):
-            store_conversation_turn(user, query, safe_text(rag_res["answer"]))
+            store_conversation_turn(user, query, rag_res["answer"])
+            QueryLog.objects.create(user=user, query=query, top_score=rag_res.get("top_score", 0.0), chunks=rag_res.get("chunks", []))
             return Response({**rag_res, "mode": "rag"})
+        # fallback to agent
+        agent = build_agent(user_id=user.id, domain=domain, document_id=document_id, mood=mood, history=memory, agent_enabled=True)
+        agent_raw = agent.run(query)
+        agent_res = normalize_agent_output(agent_raw)
+        store_conversation_turn(user, query, safe_text(agent_res["answer"]))
+        QueryLog.objects.create(user=user, query=query, top_score=rag_res.get("top_score", 0.0), chunks=rag_res.get("chunks", []))
+        return Response({"answer": agent_res["answer"], "mode": "agent_fallback", "confidence": float(rag_res.get("confidence", 0)), "chunks": rag_res.get("chunks", []), "trace": agent_res.get("trace", [])})
 
-        agent_res = agentic_answer(query, user.id, domain, document_id, user=user)
-        final_text = safe_text(agent_res.get("answer"))
-
-        store_conversation_turn(user, query, final_text)
-
-        return Response({
-            "answer": final_text,
-            "mode": "agent_fallback",
-            "confidence": float(rag_res.get("confidence", 0)),
-            "chunks": rag_res.get("chunks", []),
-            "trace": agent_res.get("trace", [])
-        })
-
-
-# =====================================================================
-# FEEDBACK
-# =====================================================================
-
+# -------------------------------------------------------
+# FEEDBACK SYSTEM
+# -------------------------------------------------------
 class FeedbackAPIView(APIView):
     permission_classes = [IsAuthenticated]
 
@@ -188,7 +157,6 @@ class FeedbackAPIView(APIView):
 
         fb = serializer.save()
         qlog = fb.query_log
-
         for ch in (qlog.chunks or []):
             if ch.get("id"):
                 ChunkFeedback.apply_feedback(ch["id"], fb.value)
@@ -196,10 +164,9 @@ class FeedbackAPIView(APIView):
         return Response({"detail": "feedback saved"}, status=201)
 
 
-# =====================================================================
-# ANALYTICS
-# =====================================================================
-
+# -------------------------------------------------------
+# 📊 ANALYTICS
+# -------------------------------------------------------
 class AnalyticsAPIView(APIView):
     permission_classes = [IsAuthenticated]
 
@@ -217,10 +184,9 @@ class AnalyticsAPIView(APIView):
         })
 
 
-# =====================================================================
-# DOCUMENT UPLOAD
-# =====================================================================
-
+# -------------------------------------------------------
+# UPLOAD DOCUMENT
+# -------------------------------------------------------
 class UploadDocumentAPIView(APIView):
     permission_classes = [IsAuthenticated]
 
@@ -231,24 +197,21 @@ class UploadDocumentAPIView(APIView):
 
         ext = Path(file.name).suffix
         with tempfile.NamedTemporaryFile(delete=False, suffix=ext) as tmp:
-            for chunk in file.chunks():
-                tmp.write(chunk)
-            tmp_path = tmp.name
+            for c in file.chunks():
+                tmp.write(c)
+            path = tmp.name
 
-        result = index_document(tmp_path, request.user.id, file.name)
-        return Response(result, status=201)
+        return Response(index_document(path, request.user.id, file.name), status=201)
 
 
-# =====================================================================
-# DOCUMENT LIST
-# =====================================================================
-
+# -------------------------------------------------------
+# LIST DOCUMENTS BY DOMAIN
+# -------------------------------------------------------
 class DocumentListAPIView(APIView):
     permission_classes = [IsAuthenticated]
 
     def get(self, request):
         docs = UploadedDocument.objects.filter(user=request.user).order_by("domain", "-created_at")
-
         data = {}
         for d in docs:
             dom = (d.domain or "general").lower()
@@ -259,40 +222,34 @@ class DocumentListAPIView(APIView):
                 "domain": dom,
                 "created_at": d.created_at
             })
-
         return Response(data)
 
 
-# =====================================================================
-# DOCUMENT DELETE
-# =====================================================================
-
+# -------------------------------------------------------
+# DELETE DOCUMENT + Remove Vectors
+# -------------------------------------------------------
 class DocumentDeleteAPIView(APIView):
     permission_classes = [IsAuthenticated]
 
     def delete(self, request, doc_id):
         try:
             doc = UploadedDocument.objects.get(id=doc_id, user=request.user)
-        except UploadedDocument.DoesNotExist:
+        except:
             return Response({"detail": "Not found"}, status=404)
 
-        chunk_ids = list(DocumentChunk.objects.filter(document=doc).values_list("pinecone_id", flat=True))
-
-        if chunk_ids:
+        ids = list(DocumentChunk.objects.filter(document=doc).values_list("pinecone_id", flat=True))
+        if ids:
             from pinecone import Pinecone
             pc = Pinecone(api_key=os.getenv("PINECONE_API_KEY"))
-            index = pc.Index(os.getenv("PINECONE_INDEX_NAME"))
-            index.delete(ids=chunk_ids)
+            pc.Index(os.getenv("PINECONE_INDEX_NAME")).delete(ids=ids)
 
         doc.delete()
-
         return Response({"detail": "Deleted"}, status=200)
 
 
-# =====================================================================
+# -------------------------------------------------------
 # DOMAIN SWITCH
-# =====================================================================
-
+# -------------------------------------------------------
 class SwitchDomainAPIView(APIView):
     permission_classes = [IsAuthenticated]
 
@@ -300,17 +257,14 @@ class SwitchDomainAPIView(APIView):
         domain = request.data.get("domain")
         if not domain:
             return Response({"detail": "domain required"}, status=400)
-
         request.session["active_domain"] = domain
         request.session.save()
-
         return Response({"detail": f"Domain -> {domain}"})
 
 
-# =====================================================================
-# CONVERSATION SYSTEM
-# =====================================================================
-
+# -------------------------------------------------------
+# CREATE NEW CHAT SESSION
+# -------------------------------------------------------
 class CreateConversationAPIView(APIView):
     permission_classes = [IsAuthenticated]
 
@@ -319,27 +273,34 @@ class CreateConversationAPIView(APIView):
         return Response({"id": str(conv.id)}, status=201)
 
 
+# -------------------------------------------------------
+# LIST ALL CONVERSATIONS (REQUIRED for URL import)
+# -------------------------------------------------------
 class ConversationListAPIView(APIView):
     permission_classes = [IsAuthenticated]
 
     def get(self, request):
         chats = Conversation.objects.filter(user=request.user).order_by("-updated_at")
-        return Response([
-            {"id": str(c.id), "title": c.title, "updated_at": c.updated_at}
-            for c in chats
-        ])
+        return Response([{
+            "id": str(c.id),
+            "title": c.title,
+            "updated_at": c.updated_at
+        } for c in chats])
 
 
+# -------------------------------------------------------
+# 🔥 MAIN CHAT VIEW — RAG + AGENT MODE
+# -------------------------------------------------------
 class ConversationChatAPIView(APIView):
     permission_classes = [IsAuthenticated]
 
     def post(self, request, cid):
         try:
             conv = Conversation.objects.get(id=cid, user=request.user)
-        except Conversation.DoesNotExist:
+        except:
             return Response({"detail": "conversation missing"}, status=404)
 
-        query = safe_text(request.data.get("query") or "").strip()
+        query = (request.data.get("query") or "").strip()
         if not query:
             return Response({"detail": "empty prompt"}, status=400)
 
@@ -349,75 +310,48 @@ class ConversationChatAPIView(APIView):
         doc_id = request.data.get("document_id")
         memory = load_vector_memory(request.user, query)
 
-        # ----------------------------- SMART CHAT DETECTION -----------------------------
+        # Check chat intent before agent/rag
         route = classify_intent_and_route(query)
-        if route.get("intent") == "chat":
+        if route.get("intent") == "chat" and not agent_mode:
             answer = call_llm_answer(question=query, context="Casual conversation.", mood=mood, max_tokens=80)
-            answer = safe_text(answer)
-
             Message.objects.create(conversation=conv, role="user", content=query)
             Message.objects.create(conversation=conv, role="assistant", content=answer)
             store_conversation_turn(request.user, query, answer)
-
             QueryLog.objects.create(user=request.user, query=query, top_score=0, chunks=[])
-
             return Response({"answer": answer, "mode": "chat", "confidence": float(route.get("confidence", 0.9)), "chunks": []})
 
-        # ------------------------------------- AGENT MODE -------------------------------------
+        # AGENT MODE (explicit toggle)
         if agent_mode:
-            agent = build_agent(
-                user_id=request.user.id,
-                domain=domain,
-                document_id=doc_id,
-                mood=mood,
-                history=memory,
-                agent_enabled=True
-            )
-
-            agent_output = agent.run(query)
-            final_text = safe_text(agent_output.get("answer"))
+            agent = build_agent(user_id=request.user.id, domain=domain, document_id=doc_id, mood=mood, history=memory, agent_enabled=True)
+            agent_raw = agent.run(query)
+            agent_res = normalize_agent_output(agent_raw)
+            final_text = safe_text(agent_res["answer"])
 
             Message.objects.create(conversation=conv, role="user", content=query)
             Message.objects.create(conversation=conv, role="assistant", content=final_text)
-
             store_conversation_turn(request.user, query, final_text)
-
             QueryLog.objects.create(user=request.user, query=query, top_score=0, chunks=[])
+            return Response(agent_res)
 
-            return Response(agent_output)
-
-        # --------------------------------------- RAG MODE --------------------------------------
+        # RAG MODE (default)
         rag_res = run_rag(query, request.user.id, domain, doc_id, mood, memory)
-        final_answer = safe_text(rag_res.get("answer"))
-
         Message.objects.create(conversation=conv, role="user", content=query)
-        Message.objects.create(conversation=conv, role="assistant", content=final_answer)
-
-        store_conversation_turn(request.user, query, final_answer)
-
-        QueryLog.objects.create(
-            user=request.user,
-            query=query,
-            top_score=rag_res.get("top_score", 0),
-            chunks=rag_res.get("chunks", [])
-        )
-
+        Message.objects.create(conversation=conv, role="assistant", content=rag_res.get("answer", ""))
+        store_conversation_turn(request.user, query, rag_res.get("answer", ""))
+        QueryLog.objects.create(user=request.user, query=query, top_score=rag_res.get("top_score", 0), chunks=rag_res.get("chunks", []))
         return Response(rag_res)
 
 
+# ========= Chat History / Rename / Delete ========= #
 class ConversationHistoryAPIView(APIView):
     permission_classes = [IsAuthenticated]
 
     def get(self, request, cid):
         try:
             conv = Conversation.objects.get(id=cid, user=request.user)
-        except Conversation.DoesNotExist:
+        except:
             return Response({"detail": "not found"}, status=404)
-
-        return Response([
-            {"role": m.role, "content": safe_text(m.content)}
-            for m in conv.messages.order_by("timestamp")
-        ])
+        return Response([{"role": m.role, "content": m.content} for m in conv.messages.order_by("timestamp")])
 
 
 class RenameConversationAPIView(APIView):
@@ -426,17 +360,14 @@ class RenameConversationAPIView(APIView):
     def patch(self, request, cid):
         try:
             conv = Conversation.objects.get(id=cid, user=request.user)
-        except Conversation.DoesNotExist:
+        except:
             return Response({"detail": "not found"}, status=404)
-
-        new_name = safe_text(request.data.get("title", "")).strip()
-        if not new_name:
+        name = request.data.get("title", "").strip()
+        if not name:
             return Response({"detail": "required"}, status=400)
-
-        conv.title = new_name
+        conv.title = name
         conv.save()
-
-        return Response({"detail": "renamed", "title": new_name})
+        return Response({"detail": "renamed", "title": name})
 
 
 class DeleteConversationAPIView(APIView):
@@ -445,9 +376,7 @@ class DeleteConversationAPIView(APIView):
     def delete(self, request, cid):
         try:
             conv = Conversation.objects.get(id=cid, user=request.user)
-        except Conversation.DoesNotExist:
+        except:
             return Response({"detail": "not found"}, status=404)
-
         conv.delete()
-
         return Response({"detail": "deleted"}, status=200)
