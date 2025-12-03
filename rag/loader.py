@@ -120,15 +120,16 @@ def index_document(file_path: str, user_id: int, original_name: str) -> Dict[str
         return {"document_id": None, "chunks_indexed": 0, "domain": "general"}
 
     raw_text = "\n".join(p[1] for p in pages)
+    # In index_document (patch)
     try:
         raw_domain = detect_domain_llm(raw_text)
     except Exception:
         raw_domain = "general"
-    domain = normalize_domain(raw_domain)
+    domain = normalize_domain(raw_domain).lower()
     print(f"[index_document] Domain → {domain}")
 
     doc = UploadedDocument.objects.create(user_id=user_id, title=original_name, original_filename=original_name, domain=domain)
-    print(f"[index_document] Document ID = {doc.id}")
+
 
     vectors = []
     global_idx = 0

@@ -1,4 +1,4 @@
-# retrieval.py
+# retrieval.py (patched)
 import os
 import logging
 from typing import List, Dict, Any, Optional
@@ -24,7 +24,7 @@ TOP_K_DEFAULT = int(os.getenv("RAG_TOP_K", "8"))
 
 # Hybrid weight defaults (change via env to tune)
 DENSE_WEIGHT = float(os.getenv("RAG_WEIGHT_DENSE", "0.45"))
-BM25_WEIGHT  = float(os.getenv("RAG_WEIGHT_BM25", "0.35"))   # slightly increased relative weight
+BM25_WEIGHT  = float(os.getenv("RAG_WEIGHT_BM25", "0.35"))
 RR_WEIGHT    = float(os.getenv("RAG_WEIGHT_RERANK", "0.15"))
 FB_WEIGHT    = float(os.getenv("RAG_WEIGHT_FEEDBACK", "0.10"))
 
@@ -34,11 +34,9 @@ USE_QUERY_REWRITE = str(os.getenv("USE_QUERY_REWRITE", "false")).lower() in ("1"
 
 RERANKER_MODEL = os.getenv("RERANKER_MODEL", "cross-encoder/ms-marco-MiniLM-L6-v2")
 
-# Minimum hybrid score and text length — made friendlier for small docs
-# Make RAG permissive
+# Minimum hybrid score and text length — made stricter to avoid tiny junk chunks
 MIN_HYBRID_CONF = float(os.getenv("MIN_HYBRID_CONF", "0.15"))
-MIN_TEXT_LEN = int(os.getenv("MIN_TEXT_LEN", "5"))
-
+MIN_TEXT_LEN = int(os.getenv("MIN_TEXT_LEN", "80"))   # increased minimum chunk length
 
 _embedder = None
 _reranker = None
@@ -76,6 +74,17 @@ def _extract_text(meta: Dict[str, Any]) -> str:
     txt = re.sub(r'\s{2,}', ' ', txt).strip()
     return txt
 
+def _build_filter(user_id: Optional[int], domain: Optional[str], document_id: Optional[str]) -> Dict[str, Any]:
+    flt: Dict[str, Any] = {}
+    if user_id is not None:
+        flt["user_id"] = str(user_id)
+    if domain:
+        # ensure stored domain normalization is lowercase
+        flt["domain"] = str(domain).lower()
+    if document_id:
+        flt["document_id"] = str(document_id)
+    return flt
+
 def query_vectors(query_text: str, user_id: Optional[int]=None, domain: Optional[str]=None,
                   document_id: Optional[str]=None, top_k: int=TOP_K_DEFAULT) -> List[Dict[str, Any]]:
     if not query_text or not query_text.strip():
@@ -86,31 +95,32 @@ def query_vectors(query_text: str, user_id: Optional[int]=None, domain: Optional
             return []
         q_vec = q_embs[0]
     except Exception as e:
-        logger.error(f"query_vectors(): Pinecone FILTERED query failed → returning empty. ERROR: {e}")
+        logger.error(f"query_vectors(): embedding failed → returning empty. ERROR: {e}")
         return []
 
-    flt: Dict[str, Any] = {}
-    if user_id is not None:
-        # ensure pinecone metadata filter uses string type (most insert workflows use str)
-        flt["user_id"] = str(user_id)
-    if domain:
-        flt["domain"] = domain
-    if document_id:
-        flt["document_id"] = document_id
+    flt = _build_filter(user_id, domain, document_id)
+
     try:
         index = _get_pinecone_index()
     except Exception as e:
         logger.error(f"query_vectors(): failed to get Pinecone index: {e}")
         return []
+
     try:
-        res = index.query(vector=q_vec, top_k=top_k, include_metadata=True, filter=flt or None)
+        # try with filter if any filters are present; else without filter
+        if flt:
+            res = index.query(vector=q_vec, top_k=top_k, include_metadata=True, filter=flt)
+        else:
+            res = index.query(vector=q_vec, top_k=top_k, include_metadata=True)
     except Exception as e:
-        logger.error(f"query_vectors(): Pinecone query failed (with filter): {e}")
+        logger.error(f"query_vectors(): Pinecone query failed: {e}")
+        # Last-ditch attempt without filter
         try:
             res = index.query(vector=q_vec, top_k=top_k, include_metadata=True)
         except Exception as e2:
-            logger.error(f"query_vectors(): Pinecone query failed (no filter): {e2}")
+            logger.error(f"query_vectors(): Pinecone fallback query failed: {e2}")
             return []
+
     output: List[Dict[str, Any]] = []
     for m in res.get("matches", []):
         meta = m.get("metadata") or {}
@@ -124,7 +134,7 @@ def query_vectors(query_text: str, user_id: Optional[int]=None, domain: Optional
 
 def retrieve(query: str, user_id: Optional[int]=None, domain: Optional[str]=None,
              document_id: Optional[str]=None, top_k: int=TOP_K_DEFAULT) -> List[Dict[str, Any]]:
-    logger.info(f"retrieve(): query={query[:80]}...")
+    logger.info(f"retrieve(): query={query[:120]}...")
     effective_query = query
 
     # Optional rewrite (disabled unless configured)
@@ -137,6 +147,7 @@ def retrieve(query: str, user_id: Optional[int]=None, domain: Optional[str]=None
             )
             if rq and len(rq) < 400:
                 effective_query = rq
+            logger.debug("retrieve(): query rewritten for retrieval")
         except Exception as e:
             logger.warning(f"retrieve(): query rewrite failed: {e}")
 
@@ -149,24 +160,21 @@ def retrieve(query: str, user_id: Optional[int]=None, domain: Optional[str]=None
     if not dense:
         return []
 
-    # domain auto-detect
-    if domain is None:
-        domains = [d["meta"].get("domain") for d in dense if d["meta"].get("domain")]
-        if domains:
-            domain = max(set(domains), key=domains.count)
+    # Do NOT auto-override caller's domain. Keep domain as specified by caller.
+    # filter dense by domain only if caller provided a domain (we already applied filter at vector query)
+    filtered = dense
 
-    # relax filter if empty
-    filtered = [d for d in dense if (domain is None or d["meta"].get("domain") == domain)]
-    if not filtered:
-        filtered = dense
-    dense = filtered
-
-    # Filter out trivially short chunks early
-    dense = [d for d in dense if len((d.get("text") or "").strip()) >= MIN_TEXT_LEN] or dense
+    # Filter out trivially short chunks early (use MIN_TEXT_LEN)
+    filtered_long = [d for d in filtered if len((d.get("text") or "").strip()) >= MIN_TEXT_LEN]
+    if filtered_long:
+        dense = filtered_long
+    else:
+        # if no chunk passes MIN_TEXT_LEN, keep the (filtered) list but log it
+        logger.debug("retrieve(): no chunk >= MIN_TEXT_LEN; keeping original filtered set (small docs)")
 
     # BM25 scoring (on the small dense set)
-    corpus_tokens = [d["text"].split() for d in dense]
     try:
+        corpus_tokens = [d["text"].split() for d in dense]
         bm25 = BM25Okapi(corpus_tokens)
         bm25_scores = bm25.get_scores(effective_query.split())
     except Exception as e:
@@ -177,11 +185,15 @@ def retrieve(query: str, user_id: Optional[int]=None, domain: Optional[str]=None
 
     # feedback map
     pine_ids = [d["id"] for d in dense]
-    fb_map = { fb.pinecone_id: fb for fb in ChunkFeedback.objects.filter(pinecone_id__in=pine_ids) }
+    try:
+        fb_map = { fb.pinecone_id: fb for fb in ChunkFeedback.objects.filter(pinecone_id__in=pine_ids) }
+    except Exception as e:
+        logger.warning(f"retrieve(): failed to load chunk feedback: {e}")
+        fb_map = {}
 
     # optionally run reranker
     rr = [0.0] * len(dense)
-    if USE_RERANKER:
+    if USE_RERANKER and dense:
         try:
             from sentence_transformers import CrossEncoder
             rr_model = CrossEncoder(RERANKER_MODEL)
@@ -191,7 +203,7 @@ def retrieve(query: str, user_id: Optional[int]=None, domain: Optional[str]=None
             logger.warning(f"retrieve(): reranker failed: {e}")
             rr = [0.0] * len(dense)
 
-    # normalize and combine
+    # normalize and combine scores
     if rr:
         rmin, rmax = min(rr), max(rr)
         rspan = max(1e-6, rmax - rmin)
@@ -214,7 +226,7 @@ def retrieve(query: str, user_id: Optional[int]=None, domain: Optional[str]=None
         hybrid = max(0.0, min(1.0, hybrid))
 
         # dedupe by normalized snippet
-        norm_text = ' '.join((d.get("text") or "").split()).lower()[:200]
+        norm_text = ' '.join((d.get("text") or "").split()).lower()[:300]
         if norm_text in seen_norm_texts:
             continue
         seen_norm_texts.add(norm_text)
