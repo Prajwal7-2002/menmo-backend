@@ -164,3 +164,9 @@ def build_agent(user_id=None, agent_enabled=True, **kwargs):
             user_obj = None
 
     return SimpleAgent(user_id=user_id, agent_enabled=agent_enabled, user_obj=user_obj)
+
+
+import langchain, langchain_core
+print("[DEBUG] LangChain Runtime Version:", langchain.__version__)
+print("[DEBUG] LangChain-Core Runtime Version:", langchain_core.__version__)
+print("[DEBUG] LangChain Path:", langchain.__file__)
