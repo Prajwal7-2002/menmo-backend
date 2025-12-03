@@ -86,8 +86,9 @@ def query_vectors(query_text: str, user_id: Optional[int]=None, domain: Optional
             return []
         q_vec = q_embs[0]
     except Exception as e:
-        logger.error(f"query_vectors(): embedding failed: {e}")
+        logger.error(f"query_vectors(): Pinecone FILTERED query failed → returning empty. ERROR: {e}")
         return []
+
     flt: Dict[str, Any] = {}
     if user_id is not None:
         # ensure pinecone metadata filter uses string type (most insert workflows use str)
