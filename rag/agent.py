@@ -11,7 +11,8 @@ from langchain_core.prompts import PromptTemplate
 logger = logging.getLogger(__name__)
 
 try:
-    from langchain.agents import create_react_agent, AgentExecutor
+    from langchain.agents.react.base import create_react_agent
+    from langchain.agents import AgentExecutor
     
     LANGCHAIN_AVAILABLE = True
 except Exception:

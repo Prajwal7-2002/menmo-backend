@@ -86,6 +86,18 @@ class WrappedLLM(BaseChatModel):
             message=AIMessage(content=text)
         )
         return ChatResult(generations=[generation])
+        
+        # ---------- REQUIRED: AgentExecutor always calls invoke() ----------
+    def invoke(self, input_data, **kwargs):
+        if isinstance(input_data, dict):
+            input_data = input_data.get("input", "")
+
+        result = self.generate(
+            messages=[[HumanMessage(content=input_data)]]
+        )
+
+        return result.generations[0].message.content
+
 
 
 # ====================================================================
