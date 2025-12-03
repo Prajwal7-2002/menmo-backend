@@ -3,38 +3,36 @@ from rag.llm import call_llm_answer
 
 def fallback_llm_tool(query: str, context: str = "") -> str:
     """
-    Safe fallback used when:
-    - The agent can't choose a tool
-    - A tool fails
-    - Memory needs summarization
-    Always returns a short, clean sentence.
+    A very safe fallback that ALWAYS returns a clean, short text answer.
+    Used when planner cannot pick a valid tool or when memory needs summarization.
     """
 
-    # ---- Detect if context is memory-like ----
+    # ---- 1. Detect memory context more reliably ----
     is_memory = False
     if context:
         lowered = context.lower()
         if any(k in lowered for k in ["memory", "fact:", "stored", "recall"]):
             is_memory = True
 
-    # ---- System prompt depending on context ----
+    # ---- 2. Build minimal prompt (VERY IMPORTANT) ----
     if is_memory:
         system_instruction = (
             "You are summarizing the user's stored memories. "
-            "Return ONE short sentence using those memories. "
+            "Return ONE short sentence using those memories as evidence. "
             "Do not hallucinate. If unsure, say: 'I don't know based on the memory.'"
         )
     else:
         system_instruction = (
-            "Provide a short and helpful answer. "
-            "If the user greets you, respond normally. "
+            "Provide a short, helpful answer. "
+            "If the user greets you (hi, hello, hey), respond naturally. "
+            "Never answer with an empty string. "
             "If unsure, say: 'I'm not sure, but I can help if you clarify.'"
         )
 
-    # ---- Build compact LLM context ----
+    # ---- 3. Build context ----
     compact_context = f"{system_instruction}\n\nContext:\n{context or 'None'}"
 
-    # ---- Call model ----
+    # ---- 4. Try generating ----
     try:
         result = call_llm_answer(
             question=query,
@@ -45,22 +43,27 @@ def fallback_llm_tool(query: str, context: str = "") -> str:
     except Exception:
         return "I'm here to help — can you clarify that?"
 
-    # ---- Clean output ----
+    # ---- 5. Clean & normalize output ----
     if not result or not str(result).strip():
         return "I'm here to help — can you rephrase that?"
 
+    # strip weird characters or whitespace
     text = str(result).strip()
 
-    # ---- Strip accidental JSON ----
+    # remove stray JSON formatting or quotes
     if text.startswith("{") or text.startswith("["):
         try:
             import json
             parsed = json.loads(text)
             if isinstance(parsed, dict):
                 text = parsed.get("answer") or parsed.get("message") or str(parsed)
-            elif isinstance(parsed, list):
-                text = " ".join([str(x) for x in parsed])
+            else:
+                text = str(parsed)
         except Exception:
-            pass
+            pass  # fallback to text
+
+    # Final safety check: avoid returning huge blocks
+    if len(text) > 800:
+        text = text[:800].rsplit(".", 1)[0] + "."
 
     return text
