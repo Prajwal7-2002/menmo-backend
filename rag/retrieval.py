@@ -35,8 +35,10 @@ USE_QUERY_REWRITE = str(os.getenv("USE_QUERY_REWRITE", "false")).lower() in ("1"
 RERANKER_MODEL = os.getenv("RERANKER_MODEL", "cross-encoder/ms-marco-MiniLM-L6-v2")
 
 # Minimum hybrid score and text length — made friendlier for small docs
-MIN_HYBRID_CONF = float(os.getenv("MIN_HYBRID_CONF", "0.35"))
-MIN_TEXT_LEN = int(os.getenv("MIN_TEXT_LEN", "20"))
+# Make RAG permissive
+MIN_HYBRID_CONF = float(os.getenv("MIN_HYBRID_CONF", "0.15"))
+MIN_TEXT_LEN = int(os.getenv("MIN_TEXT_LEN", "5"))
+
 
 _embedder = None
 _reranker = None

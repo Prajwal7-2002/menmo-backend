@@ -18,17 +18,22 @@ def _build_payload(question: str, context: str, mood: str, max_tokens: int):
     }.get(mood, "Clear and factual.")
 
     system = (
-        "You are a Retrieval-Augmented assistant.\n\n"
-        "- Use ONLY the information inside the provided context\n"
-        "- Do NOT invent facts or hallucinate\n"
-        '- If answer is not found, respond only with: "I don’t know based on the available documentation."\n\n'
-        f"Tone style → {mood_style}\n\n"
-        "---------------- CONTEXT ----------------\n"
+        "You are a hybrid RAG + general-knowledge assistant.\n\n"
+        "RULES:\n"
+        "1. If context is provided → Prefer answering from the context.\n"
+        "2. If context is empty OR irrelevant → Use normal world knowledge.\n"
+        "3. NEVER answer with 'I don’t know based on the available documentation' "
+        "unless BOTH are true:\n"
+        "   - context exists\n"
+        "   - and context is insufficient.\n"
+        "4. Do NOT hallucinate when context contradicts facts.\n\n"
+        f"Tone → {mood_style}\n\n"
+        "--------------- CONTEXT ----------------\n"
         f"{context}\n"
         "-----------------------------------------\n"
     )
 
-    payload = {
+    return {
         "model": GROQ_MODEL,
         "messages": [
             {"role": "system", "content": system},
@@ -38,7 +43,7 @@ def _build_payload(question: str, context: str, mood: str, max_tokens: int):
         "temperature": 0.2,
         "top_p": 0.9,
     }
-    return payload
+
 
 def _post_with_backoff(json_payload, headers, max_attempts=5):
     backoff = 1.0

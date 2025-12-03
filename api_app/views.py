@@ -65,6 +65,7 @@ def normalize_agent_output(agent_output: Any) -> Dict[str, Any]:
 
 class AskAPIView(APIView):
     permission_classes = [IsAuthenticated]
+
     def post(self, request):
         serializer = AskSerializer(data=request.data)
         serializer.is_valid(raise_exception=True)
@@ -75,12 +76,14 @@ class AskAPIView(APIView):
         document_id = request.data.get("document_id")
         memory = load_vector_memory(user, query)
         route = classify_intent_and_route(query)
-        intent = route["intent"]
-        intent_conf = route["confidence"]
+        intent = route.get("intent")
+        intent_conf = route.get("confidence", 1.0)
 
+        # force doc intent if explicitly passing document_id
         if document_id:
             intent = "doc"
 
+        # MEMORY STORE
         if intent == "memory_store":
             content = query
             low = content.strip().lower()
@@ -99,11 +102,13 @@ class AskAPIView(APIView):
                     stored = True
                 except Exception:
                     stored = False
+
             QueryLog.objects.create(user=user, query=query, top_score=0.0, chunks=[])
             if stored:
                 return Response({"answer": "Okay — I will remember that.", "mode": "memory_store", "confidence": intent_conf})
             return Response({"answer": "I tried to save that memory but ran into an issue.", "mode": "memory_store", "confidence": 0.0}, status=500)
 
+        # MEMORY RECALL via agent
         if intent == "memory_recall":
             agent = build_agent(user_id=user.id, domain=domain, document_id=document_id, mood=mood, history=memory, agent_enabled=True)
             agent_raw = agent.run(query)
@@ -112,18 +117,21 @@ class AskAPIView(APIView):
             store_conversation_turn(user, query, final_text)
             return Response({"answer": final_text, "mode": "agent_memory", "confidence": intent_conf, "chunks": agent_res.get("chunks", []), "trace": agent_res.get("trace", [])})
 
+        # CHAT-only intent -> direct LLM
         if intent == "chat":
             answer = call_llm_answer(question=query, context="Casual conversation.", mood=mood, max_tokens=60)
             store_conversation_turn(user, query, answer)
             QueryLog.objects.create(user=user, query=query, top_score=0.0, chunks=[])
             return Response({"answer": answer, "mode": "chat", "confidence": intent_conf, "chunks": []})
 
+        # DOCUMENT question -> run RAG, fallback to agent
         if intent == "doc":
             rag_res = run_rag(query, user.id, domain, document_id, mood, memory)
             if rag_res.get("validated"):
                 store_conversation_turn(user, query, rag_res["answer"])
                 QueryLog.objects.create(user=user, query=query, top_score=rag_res.get("top_score", 0.0), chunks=rag_res.get("chunks", []))
                 return Response({**rag_res, "mode": "rag"})
+            # fallback to agent
             agent = build_agent(user_id=user.id, domain=domain, document_id=document_id, mood=mood, history=memory, agent_enabled=True)
             agent_raw = agent.run(query)
             agent_res = normalize_agent_output(agent_raw)
@@ -131,13 +139,13 @@ class AskAPIView(APIView):
             QueryLog.objects.create(user=user, query=query, top_score=rag_res.get("top_score", 0.0), chunks=rag_res.get("chunks", []))
             return Response({"answer": agent_res["answer"], "mode": "agent_fallback", "chunks": rag_res.get("chunks", []), "confidence": float(rag_res.get("confidence", 0)), "trace": agent_res.get("trace", [])})
 
-        # default RAG-first
+        # Default RAG-first path
         rag_res = run_rag(query, user.id, domain, document_id, mood, memory)
         if rag_res.get("validated"):
             store_conversation_turn(user, query, rag_res["answer"])
             QueryLog.objects.create(user=user, query=query, top_score=rag_res.get("top_score", 0.0), chunks=rag_res.get("chunks", []))
             return Response({**rag_res, "mode": "rag"})
-        # fallback to agent
+        # fallback to agent if RAG not validated
         agent = build_agent(user_id=user.id, domain=domain, document_id=document_id, mood=mood, history=memory, agent_enabled=True)
         agent_raw = agent.run(query)
         agent_res = normalize_agent_output(agent_raw)

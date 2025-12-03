@@ -12,15 +12,15 @@ def _log_and_response(query: str, answer: str, chunks: List[Dict[str,Any]], top_
     log = QueryLog.objects.create(query=query, answer=answer, top_score=top_score, chunks=chunks)
     return {"answer": answer, "validated": validated, "confidence": float(top_score or 0.0), "chunks": chunks, "query_id": str(log.id), "top_score": float(top_score or 0.0)}
 
-def run_rag(query: str, user_id: Optional[int]=None, domain: Optional[str]=None,
-            document_id: Optional[str]=None, mood: str="neutral", history: Optional[List[Dict[str,str]]]=None,
-            max_chunks: int=4) -> Dict[str, Any]:
+def run_rag(query: str, user_id: Optional[int] = None, domain: Optional[str] = None,
+            document_id: Optional[str] = None, mood: str = "neutral", history: Optional[List[Dict[str, str]]] = None,
+            max_chunks: int = 4) -> Dict[str, Any]:
     """
     Retrieval -> gating -> LLM answer flow.
     Returns diagnostic fields: answer, validated (bool), confidence (float), chunks (list), top_score (float)
     """
     # Retrieve with diagnostics
-    chunks, scores, conf = retrieve_with_conf(query, user_id, domain, document_id, top_k=max_chunks*2)
+    chunks, scores, conf = retrieve_with_conf(query, user_id, domain, document_id, top_k=max_chunks * 2)
     if not chunks:
         return _log_and_response(query, "", [], 0.0, validated=False)
 
@@ -34,13 +34,13 @@ def run_rag(query: str, user_id: Optional[int]=None, domain: Optional[str]=None,
     logger.info(f"run_rag: conf={conf:.4f}  top_text_len={text_len}  bm25_norm={bm25_norm:.4f} top_score={top_score:.4f}")
 
     # RELAXED GATING
-    accepted = False
-    if is_confident_enough(conf):
+    # RELAXED GATING FOR SMALL DOCS
+    if conf >= 0.15:
         accepted = True
     else:
-        # Accept if any of these hold — tuned for smaller documents
-        if (text_len >= 20) or (bm25_norm >= 0.30) or (top_score >= 0.25):
+        if (text_len >= 5) or (bm25_norm >= 0.10) or (top_score >= 0.10):
             accepted = True
+
 
     if not accepted:
         logger.info("run_rag: gating rejected (insufficient confidence/bm25/text_len)")

@@ -121,10 +121,15 @@ class SimpleAgent:
         if self._executor:
             try:
                 result = self._executor.invoke({"input": query})
-                final_answer = result.get("output", "")
+                raw = result.get("output", "") or ""
+                if "Final Answer:" in raw:
+                    final_answer = raw.split("Final Answer:", 1)[1].strip()
+                else:
+                    final_answer = raw.strip()
+
 
                 return {
-                    "answer": final_answer,
+                    "answer": final_answer or "I’m not sure, but I can help if you clarify.",
                     "mode": "agent",
                     "confidence": 1.0,
                     "chunks": [],
