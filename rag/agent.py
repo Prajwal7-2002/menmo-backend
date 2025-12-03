@@ -1,4 +1,4 @@
-# rag/agent.py — FINAL WORKING AGENT (LangChain 0.2+ Stable)
+# rag/agent.py
 from typing import Dict, Any
 import logging
 
@@ -21,16 +21,25 @@ try:
 except Exception:
     User = None
 
+# Agent prompt: allow agent discretion — agent decides when web is necessary.
 SYSTEM_PROMPT = """
 You are NeuroStack AI — an intelligent tool-using agent.
 
-High-level rules (strict RAG-first):
-1. ALWAYS try to answer from rag_search outputs first.
-2. If rag_search returns insufficient info, consult memory_search.
-3. Use rewrite_query to improve retrieval if the question is ambiguous.
-4. Use web_search ONLY if rag_search+memory_search cannot produce an answer OR the user explicitly requests current/external facts (e.g. 'who is', 'today', 'latest', 'news', dates).
-5. If uncertain or not found, respond: "I don’t know based on the available documentation."
-6. Your final answer MUST appear only in the form: Final Answer: <answer>
+GOAL:
+- Prefer internal evidence (RAG) and memory for answers.
+- You MAY use web_search when internal evidence and memory are insufficient or
+  when the user explicitly requests up-to-date world knowledge.
+- If unsure and no evidence, prefer a conservative response: "I don’t know based on the available documentation."
+
+FORMAT RULES:
+- When using tools follow this format:
+  Thought: <reason>
+  Action: <tool_name>
+  Action Input: <input>
+  Observation: <tool output>
+
+- If no tool is needed produce:
+  Final Answer: <your answer>
 """
 
 REACT_PROMPT = PromptTemplate.from_template("""
@@ -41,13 +50,13 @@ You have access to the following tools:
 
 Tool names: {tool_names}
 
-Format:
+Use this format:
 Thought: <reason>
 Action: <tool_name>
 Action Input: <input>
 Observation: <tool output>
 
-If no tool needed:
+If no tool is needed:
 Final Answer: <your answer>
 
 Question: {input}
@@ -57,10 +66,11 @@ Thought: Let's think step-by-step.
 """)
 
 class SimpleAgent:
-    def __init__(self, user_id=None, agent_enabled=True, user_obj=None):
+    def __init__(self, user_id=None, agent_enabled=True, user_obj=None, allow_web: bool = True):
         self.user_id = user_id
         self.user = user_obj
         self.enabled = agent_enabled
+        self.allow_web = allow_web
         self._executor = None
 
         if LANGCHAIN_AVAILABLE and self.enabled:
@@ -72,22 +82,19 @@ class SimpleAgent:
 
     def _build_agent(self):
         llm = WrappedLLM()
-        tools = get_langchain_tools(user_obj=self.user)
+        tools = get_langchain_tools(user_obj=self.user, allow_web=self.allow_web)
 
-        tool_names = ", ".join(t.name for t in tools) if isinstance(tools, list) else ", ".join(list(tools.keys()))
-        tools_block = "\n".join(f"- {t.name}: {t.description}" for t in tools) if isinstance(tools, list) else "\n".join(f"- {k}" for k in tools.keys())
+        # tools could be dict (fallback) or list (langchain)
+        if isinstance(tools, list):
+            tool_names = ", ".join(t.name for t in tools)
+            tools_block = "\n".join(f"- {t.name}: {t.description}" for t in tools)
+        else:
+            tool_names = ", ".join(tools.keys())
+            tools_block = "\n".join(f"- {k}" for k in tools.keys())
 
-        prompt = REACT_PROMPT.partial(
-            system_prompt=SYSTEM_PROMPT,
-            tools=tools_block,
-            tool_names=tool_names
-        )
+        prompt = REACT_PROMPT.partial(system_prompt=SYSTEM_PROMPT, tools=tools_block, tool_names=tool_names)
 
-        agent = create_react_agent(
-            llm=llm,
-            tools=tools,
-            prompt=prompt
-        )
+        agent = create_react_agent(llm=llm, tools=tools, prompt=prompt)
 
         self._executor = AgentExecutor(
             agent=agent,
@@ -101,27 +108,22 @@ class SimpleAgent:
     def _extract_final_answer(self, raw: str) -> str:
         if not raw:
             return ""
-        # prefer explicit "Final Answer:"
         if "Final Answer:" in raw:
             return raw.split("Final Answer:", 1)[1].strip()
-        # otherwise, attempt a last-line fallback
+        # fallback: last non-empty line
         lines = [l.strip() for l in raw.splitlines() if l.strip()]
         return lines[-1] if lines else raw.strip()
 
     def run(self, query: str) -> Dict[str, Any]:
         """
         Run the agent. If LangChain executor exists, use it.
-        We return a dict with answer, mode, confidence, chunks (empty), trace.
+        Returns dict with answer, mode, confidence, chunks, trace.
         """
         if self._executor:
             try:
                 result = self._executor.invoke({"input": query})
                 raw = result.get("output", "") or ""
                 final_answer = self._extract_final_answer(raw)
-
-                # If the agent used web_search but RAG/memory contained evidence, that's undesirable.
-                # We can't always detect that here, but the prompt reduces such cases.
-
                 return {
                     "answer": final_answer or "I don’t know based on the available documentation.",
                     "mode": "agent",
@@ -133,7 +135,7 @@ class SimpleAgent:
             except Exception as e:
                 logger.exception("Agent error: %s", e)
                 return {
-                    "answer": f"Agent failed to execute the full plan. Reverting to basic LLM. Error: {str(e)}",
+                    "answer": f"Agent failed to execute the full plan. Reverting to fallback. Error: {str(e)}",
                     "mode": "agent_error",
                     "confidence": 0.0,
                     "chunks": [],
@@ -141,15 +143,10 @@ class SimpleAgent:
                     "steps": 0
                 }
 
-        # Fallback: if the AgentExecutor was not built, use a simple LLM call that respects RAG-first policy.
+        # Fallback (AgentExecutor not built)
         try:
-            # Ask LLM to follow the rag-first policy in a compact prompt
-            compact_system = (
-                "You are a safe assistant. Try to answer using internal documents. "
-                "If you cannot, say: 'I don’t know based on the available documentation.'"
-            )
             out = WrappedLLM().invoke(query)
-        except Exception as e:
+        except Exception:
             out = "I don’t know based on the available documentation."
 
         return {
@@ -161,7 +158,8 @@ class SimpleAgent:
             "steps": 1
         }
 
-def build_agent(user_id=None, agent_enabled=True, **kwargs):
+
+def build_agent(user_id=None, agent_enabled=True, allow_web: bool = True, **kwargs):
     user_obj = None
     if User:
         try:
@@ -169,4 +167,4 @@ def build_agent(user_id=None, agent_enabled=True, **kwargs):
         except Exception:
             user_obj = None
 
-    return SimpleAgent(user_id=user_id, agent_enabled=agent_enabled, user_obj=user_obj)
+    return SimpleAgent(user_id=user_id, agent_enabled=agent_enabled, user_obj=user_obj, allow_web=allow_web)

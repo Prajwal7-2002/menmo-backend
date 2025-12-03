@@ -1,4 +1,4 @@
-# rag/views.py (FINAL patched version — uses new agent, no controller references)
+# api_app/views.py (FINAL patched version — uses new agent, no controller references)
 
 import os
 import json

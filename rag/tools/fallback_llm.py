@@ -3,10 +3,9 @@ from rag.llm import call_llm_answer
 
 def fallback_llm_tool(query: str, context: str = "") -> str:
     """
-    A very safe fallback that ALWAYS returns a clean, short text answer.
+    A safe fallback that ALWAYS returns a short, clean text answer.
     Used when planner cannot pick a valid tool or when memory needs summarization.
     """
-
     # ---- 1. Detect memory context more reliably ----
     is_memory = False
     if context:
@@ -47,7 +46,6 @@ def fallback_llm_tool(query: str, context: str = "") -> str:
     if not result or not str(result).strip():
         return "I'm here to help — can you rephrase that?"
 
-    # strip weird characters or whitespace
     text = str(result).strip()
 
     # remove stray JSON formatting or quotes
@@ -61,9 +59,5 @@ def fallback_llm_tool(query: str, context: str = "") -> str:
                 text = str(parsed)
         except Exception:
             pass  # fallback to text
-
-    # Final safety check: avoid returning huge blocks
-    if len(text) > 800:
-        text = text[:800].rsplit(".", 1)[0] + "."
 
     return text
