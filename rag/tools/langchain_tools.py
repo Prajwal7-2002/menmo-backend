@@ -9,7 +9,10 @@ from rag.tools.query_rewrite import rewrite_query_tool
 from rag.tools.fallback_llm import fallback_llm_tool
 from rag.llm import call_llm_answer
 
-# Try to import LangChain types; degrade gracefully if unavailable
+# new evaluator
+from rag.tools.evaluate_context import evaluate_context_tool
+
+# Try imports; degrade gracefully
 try:
     from langchain.tools import Tool
     from langchain_core.language_models.chat_models import BaseChatModel
@@ -25,10 +28,6 @@ except Exception:
 
 
 class WrappedLLM(BaseChatModel):
-    """
-    Controlled LLM adapter used by the React agent.
-    Converts LangChain messages to our call_llm_answer format and returns ChatResult.
-    """
     model_name = "groq_react_chat"
 
     @property
@@ -50,13 +49,15 @@ class WrappedLLM(BaseChatModel):
 
     def _generate(self, messages, stop=None, **kwargs):
         msgs = self._convert_messages(messages)
-        # Add a lightweight system guard to encourage tool usage or final answer
+        # Enforce RAG-first behavior in the system guard so agent prefers RAG/memory.
         msgs.insert(0, {
             "role": "system",
             "content": (
-                "You may call tools when helpful. "
-                "If you choose not to call a tool, output 'Final Answer: <your answer>'. "
-                "If you call a tool, follow the format: Action: <tool_name>\\nAction Input: <input>"
+                "You are an agent that MUST prefer internal document evidence and memory. "
+                "Use tools for retrieval and rewriting. "
+                "Only use web_search when internal sources are insufficient and you explicitly state why. "
+                "Format tool calls exactly as: Action: <tool_name>\\nAction Input: <JSON string or plain text>\\n"
+                "When done, output: Final Answer: <answer>"
             )
         })
 
@@ -71,7 +72,8 @@ class WrappedLLM(BaseChatModel):
         return res.generations[0].message.content
 
 
-# --- Tool wrappers (defensive) ---
+# ---------------- Tool wrappers ----------------
+
 def tool_rag(input_str: str) -> Dict[str, Any]:
     try:
         payload = json.loads(input_str)
@@ -82,6 +84,7 @@ def tool_rag(input_str: str) -> Dict[str, Any]:
             document_id=payload.get("document_id"),
         )
     except Exception:
+        # fallback: treat input as raw query
         return rag_search(input_str, None, None, None)
 
 
@@ -109,15 +112,29 @@ def tool_fallback(input_str: str) -> str:
 
 
 def tool_web(input_str: str) -> Any:
-    # web_search_tool should be defensive by itself
     return web_search_tool(input_str)
 
 
-# --- Registry builder; caller can control web availability ---
+def tool_evaluate(input_str: str) -> Dict[str, Any]:
+    """
+    Accepts either JSON list of chunks or a JSON string: {"chunks": [...]}
+    Returns evaluate_context_tool output.
+    """
+    try:
+        p = json.loads(input_str)
+        chunks = p if isinstance(p, list) else p.get("chunks", []) or []
+    except Exception:
+        # if it's not JSON, we can't evaluate
+        return {"quality": "empty", "score": 0.0, "reason": "bad_input"}
+    return evaluate_context_tool(chunks)
+
+
+# ---------------- Registry builder (allow_web control) ----------------
+
 def get_langchain_tools(user_obj=None, allow_web: bool = True):
     """
-    Returns either a list of Tool objects (if LangChain is installed) or a fallback dict of functions.
-    allow_web: if False -> web_search is omitted (useful for offline / strict environments)
+    Returns LangChain Tool list or fallback dict depending on availability.
+    If allow_web=False the web_search tool is omitted.
     """
     if not LANGCHAIN_AVAILABLE:
         tools = {
@@ -125,18 +142,19 @@ def get_langchain_tools(user_obj=None, allow_web: bool = True):
             "memory_search": lambda q: tool_memory(q, user_obj),
             "rewrite_query": tool_rewrite,
             "fallback_llm": tool_fallback,
+            "evaluate_context": tool_evaluate,
         }
         if allow_web:
             tools["web_search"] = tool_web
         return tools
 
-    # Build LangChain Tool list
     tool_list = [
         Tool(name="rag_search", func=tool_rag, description="Primary RAG retrieval."),
         Tool(name="memory_search", func=lambda q: tool_memory(q, user_obj), description="User memory lookup."),
-        Tool(name="rewrite_query", func=tool_rewrite, description="Rewrite a bad query for retrieval."),
-        Tool(name="fallback_llm", func=tool_fallback, description="Safe fallback LLM; prefers context.")
+        Tool(name="rewrite_query", func=tool_rewrite, description="Rewrite a bad query for better retrieval."),
+        Tool(name="fallback_llm", func=tool_fallback, description="Safe fallback LLM that respects context."),
+        Tool(name="evaluate_context", func=tool_evaluate, description="Return quality/score for retrieved chunks."),
     ]
     if allow_web:
-        tool_list.append(Tool(name="web_search", func=tool_web, description="Search the web (agent decides when)."))
+        tool_list.append(Tool(name="web_search", func=tool_web, description="Search the web (agent decides)."))
     return tool_list

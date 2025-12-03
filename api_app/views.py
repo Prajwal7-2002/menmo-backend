@@ -1,4 +1,4 @@
-# api_app/views.py (FINAL patched version — uses new agent, no controller references)
+# api_app/views.py (FINAL patched — Agent-driven RAG orchestration)
 
 import os
 import json
@@ -18,7 +18,6 @@ from .serializers import AskSerializer, FeedbackSerializer
 from .models import QueryLog, Feedback
 
 from rag.models import UploadedDocument, ChunkFeedback, DocumentChunk
-from rag.pipeline import run_rag
 from rag.loader import index_document
 from rag.agent import build_agent
 
@@ -62,6 +61,7 @@ def normalize_agent_output(agent_output: Any) -> Dict[str, Any]:
             "steps": int(agent_output.get("steps", len(agent_output.get("trace", []) or [])))
         }
     return {"answer": str(agent_output), "mode": "agent", "confidence": 1.0, "chunks": [], "trace": [], "steps": 1}
+
 
 class AskAPIView(APIView):
     permission_classes = [IsAuthenticated]
@@ -124,34 +124,24 @@ class AskAPIView(APIView):
             QueryLog.objects.create(user=user, query=query, top_score=0.0, chunks=[])
             return Response({"answer": answer, "mode": "chat", "confidence": intent_conf, "chunks": []})
 
-        # DOCUMENT question -> run RAG, fallback to agent
+        # DOCUMENT question -> AGENT-driven RAG
         if intent == "doc":
-            rag_res = run_rag(query, user.id, domain, document_id, mood, memory)
-            if rag_res.get("validated"):
-                store_conversation_turn(user, query, rag_res["answer"])
-                QueryLog.objects.create(user=user, query=query, top_score=rag_res.get("top_score", 0.0), chunks=rag_res.get("chunks", []))
-                return Response({**rag_res, "mode": "rag"})
-            # fallback to agent
+            # Let the agent orchestrate retrieval/rewrite/retry
             agent = build_agent(user_id=user.id, domain=domain, document_id=document_id, mood=mood, history=memory, agent_enabled=True)
-            agent_raw = agent.run(query)
-            agent_res = normalize_agent_output(agent_raw)
-            store_conversation_turn(user, query, safe_text(agent_res["answer"]))
-            QueryLog.objects.create(user=user, query=query, top_score=rag_res.get("top_score", 0.0), chunks=rag_res.get("chunks", []))
-            return Response({"answer": agent_res["answer"], "mode": "agent_fallback", "chunks": rag_res.get("chunks", []), "confidence": float(rag_res.get("confidence", 0)), "trace": agent_res.get("trace", [])})
+            agent_res = agent.run(query)
+            final_ans = safe_text(agent_res.get("answer", ""))
+            store_conversation_turn(user, query, final_ans)
+            QueryLog.objects.create(user=user, query=query, top_score=agent_res.get("confidence", 0.0), chunks=agent_res.get("chunks", []))
+            return Response({"answer": final_ans, "mode": "agent", "confidence": float(agent_res.get("confidence", 0.0)), "chunks": agent_res.get("chunks", []), "trace": agent_res.get("trace", [])})
 
-        # Default RAG-first path
-        rag_res = run_rag(query, user.id, domain, document_id, mood, memory)
-        if rag_res.get("validated"):
-            store_conversation_turn(user, query, rag_res["answer"])
-            QueryLog.objects.create(user=user, query=query, top_score=rag_res.get("top_score", 0.0), chunks=rag_res.get("chunks", []))
-            return Response({**rag_res, "mode": "rag"})
-        # fallback to agent if RAG not validated
+        # Default: let the Agent orchestrate RAG + retries
         agent = build_agent(user_id=user.id, domain=domain, document_id=document_id, mood=mood, history=memory, agent_enabled=True)
-        agent_raw = agent.run(query)
-        agent_res = normalize_agent_output(agent_raw)
-        store_conversation_turn(user, query, safe_text(agent_res["answer"]))
-        QueryLog.objects.create(user=user, query=query, top_score=rag_res.get("top_score", 0.0), chunks=rag_res.get("chunks", []))
-        return Response({"answer": agent_res["answer"], "mode": "agent_fallback", "confidence": float(rag_res.get("confidence", 0)), "chunks": rag_res.get("chunks", []), "trace": agent_res.get("trace", [])})
+        agent_res = agent.run(query)
+        final_ans = safe_text(agent_res.get("answer", ""))
+        store_conversation_turn(user, query, final_ans)
+        QueryLog.objects.create(user=user, query=query, top_score=agent_res.get("confidence", 0.0), chunks=agent_res.get("chunks", []))
+        return Response({"answer": final_ans, "mode": "agent", "confidence": float(agent_res.get("confidence", 0.0)), "chunks": agent_res.get("chunks", []), "trace": agent_res.get("trace", [])})
+
 
 # -------------------------------------------------------
 # FEEDBACK SYSTEM
@@ -297,7 +287,7 @@ class ConversationListAPIView(APIView):
 
 
 # -------------------------------------------------------
-# 🔥 MAIN CHAT VIEW — RAG + AGENT MODE
+# 🔥 MAIN CHAT VIEW — AGENTIC RAG (Agent orchestrates)
 # -------------------------------------------------------
 class ConversationChatAPIView(APIView):
     permission_classes = [IsAuthenticated]
@@ -321,6 +311,7 @@ class ConversationChatAPIView(APIView):
         # Check chat intent before agent/rag
         route = classify_intent_and_route(query)
         if route.get("intent") == "chat" and not agent_mode:
+            # lightweight chat bypass: use simple LLM for small talk
             answer = call_llm_answer(question=query, context="Casual conversation.", mood=mood, max_tokens=80)
             Message.objects.create(conversation=conv, role="user", content=query)
             Message.objects.create(conversation=conv, role="assistant", content=answer)
@@ -328,7 +319,7 @@ class ConversationChatAPIView(APIView):
             QueryLog.objects.create(user=request.user, query=query, top_score=0, chunks=[])
             return Response({"answer": answer, "mode": "chat", "confidence": float(route.get("confidence", 0.9)), "chunks": []})
 
-        # AGENT MODE (explicit toggle)
+        # AGENT MODE (explicit toggle) — respect agent_mode if provided
         if agent_mode:
             agent = build_agent(user_id=request.user.id, domain=domain, document_id=doc_id, mood=mood, history=memory, agent_enabled=True)
             agent_raw = agent.run(query)
@@ -338,16 +329,20 @@ class ConversationChatAPIView(APIView):
             Message.objects.create(conversation=conv, role="user", content=query)
             Message.objects.create(conversation=conv, role="assistant", content=final_text)
             store_conversation_turn(request.user, query, final_text)
-            QueryLog.objects.create(user=request.user, query=query, top_score=0, chunks=[])
+            QueryLog.objects.create(user=request.user, query=query, top_score=agent_res.get("confidence", 0.0), chunks=agent_res.get("chunks", []))
             return Response(agent_res)
 
-        # RAG MODE (default)
-        rag_res = run_rag(query, request.user.id, domain, doc_id, mood, memory)
+        # Default: Agent orchestrates for document/knowledge queries (agent decides retrieval/web/rewrite)
+        agent = build_agent(user_id=request.user.id, domain=domain, document_id=doc_id, mood=mood, history=memory, agent_enabled=True)
+        agent_raw = agent.run(query)
+        agent_res = normalize_agent_output(agent_raw)
+        final_text = safe_text(agent_res["answer"])
+
         Message.objects.create(conversation=conv, role="user", content=query)
-        Message.objects.create(conversation=conv, role="assistant", content=rag_res.get("answer", ""))
-        store_conversation_turn(request.user, query, rag_res.get("answer", ""))
-        QueryLog.objects.create(user=request.user, query=query, top_score=rag_res.get("top_score", 0), chunks=rag_res.get("chunks", []))
-        return Response(rag_res)
+        Message.objects.create(conversation=conv, role="assistant", content=final_text)
+        store_conversation_turn(request.user, query, final_text)
+        QueryLog.objects.create(user=request.user, query=query, top_score=agent_res.get("confidence", 0.0), chunks=agent_res.get("chunks", []))
+        return Response(agent_res)
 
 
 # ========= Chat History / Rename / Delete ========= #
