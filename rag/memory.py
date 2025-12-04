@@ -196,3 +196,33 @@ def relevant_chunks(user, query: str, top_k: int = 4):
     except Exception as e:
         print("❌ relevant_chunks failed:", e)
         return []
+
+def clear_memory_for_document(user_id: int, document_id: str):
+    """
+    Deletes conversation/memory vectors linked to a deleted document.
+    Safe no-op if memory index or vectors do not exist.
+    """
+    try:
+        pc = Pinecone(api_key=PINECONE_API_KEY)
+        index = pc.Index(MEMORY_INDEX)
+
+        # Search for all memory vectors with metadata document_id
+        response = index.query(
+            vector=[0.0] * 384,  # dummy vector just to activate filter
+            top_k=500,
+            include_metadata=True,
+            filter={
+                "user": str(user_id),
+                "document_id": str(document_id)
+            }
+        )
+
+        ids = [m["id"] for m in response.get("matches", [])]
+
+        if ids:
+            index.delete(ids=ids)
+
+        print(f"🧹 Cleared {len(ids)} memory vectors for document {document_id}")
+
+    except Exception as e:
+        print(f"⚠ clear_memory_for_document failed: {e}")
