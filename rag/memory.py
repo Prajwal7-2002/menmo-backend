@@ -11,10 +11,10 @@ from pinecone import Pinecone
 # ==========================================================
 PINECONE_API_KEY = os.getenv("PINECONE_API_KEY")
 
-# 🔥 DOCUMENT VECTOR INDEX (kept separate)
+# Document vector index (separate)
 DOC_INDEX = os.getenv("PINECONE_INDEX_NAME", "neurostack-rag")
 
-# 🔥 MEMORY INDEX (completely isolated)
+# Memory vector index (fully isolated)
 MEMORY_INDEX = os.getenv("PINECONE_MEMORY_INDEX", "neurostack-memory")
 
 # ==========================================================
@@ -43,10 +43,7 @@ def get_memory_index():
 # 1️⃣  CONVERSATION MEMORY
 # ==========================================================
 def store_conversation_turn(user, query: str, answer: str):
-    """
-    Store conversation history as memory vectors in a SEPARATE index.
-    Never stored in document index.
-    """
+    """Store conversation memory vectors in memory index."""
     try:
         text = f"user:{query}\nassistant:{answer}"
         vec = get_embedder().encode(text).tolist()
@@ -66,16 +63,12 @@ def store_conversation_turn(user, query: str, answer: str):
         print("❌ Failed storing conversation memory:", e)
 
 
-
-def load_vector_memory(user, query: str, top_k: int = 6) -> List[Dict[str, Any]]:
-    """
-    Retrieve conversation memory. 
-    ONLY searches memory index. Never touches document index.
-    """
+def load_vector_memory(user, query: str, top_k: int = 6):
+    """Retrieve conversation memory ONLY from memory index."""
     try:
         q_vec = get_embedder().encode(query).tolist()
-
         index = get_memory_index()
+
         response = index.query(
             vector=q_vec,
             top_k=top_k,
@@ -109,11 +102,11 @@ def _fact_id(user):
 
 
 def memory_exists(user, text: str) -> bool:
-    """Check if fact already exists (semantic dedupe)."""
+    """Semantic dedupe for facts."""
     try:
         q_vec = get_embedder().encode(text).tolist()
-
         index = get_memory_index()
+
         response = index.query(
             vector=q_vec,
             top_k=5,
@@ -132,21 +125,19 @@ def memory_exists(user, text: str) -> bool:
         return False
 
 
-
 def add_memory_fact(user, text: str) -> bool:
-    """Store long-term memory fact (clean & deduped)."""
+    """Store long-term memory fact into memory index."""
     try:
         text = text.strip()
         if not text:
             return False
 
-        # Deduplicate
         if memory_exists(user, text):
             return False
 
         vec = get_embedder().encode(text).tolist()
-
         index = get_memory_index()
+
         index.upsert([{
             "id": _fact_id(user),
             "values": vec,
@@ -165,17 +156,14 @@ def add_memory_fact(user, text: str) -> bool:
 
 
 # ==========================================================
-# 3️⃣  MEMORY FACT RECALL
+# 3️⃣  MEMORY RECALL
 # ==========================================================
 def relevant_chunks(user, query: str, top_k: int = 4):
-    """
-    Retrieve long-term memory. 
-    NEVER hits RAG vector index.
-    """
+    """Retrieve long-term memory facts."""
     try:
         q_vec = get_embedder().encode(query).tolist()
-
         index = get_memory_index()
+
         response = index.query(
             vector=q_vec,
             top_k=top_k,
@@ -197,18 +185,18 @@ def relevant_chunks(user, query: str, top_k: int = 4):
         print("❌ relevant_chunks failed:", e)
         return []
 
+
+# ==========================================================
+# 4️⃣ MEMORY CLEANUP WHEN DOCUMENT IS DELETED
+# ==========================================================
 def clear_memory_for_document(user_id: int, document_id: str):
-    """
-    Deletes conversation/memory vectors linked to a deleted document.
-    Safe no-op if memory index or vectors do not exist.
-    """
+    """Deletes memory vectors linked to a deleted document."""
     try:
         pc = Pinecone(api_key=PINECONE_API_KEY)
         index = pc.Index(MEMORY_INDEX)
 
-        # Search for all memory vectors with metadata document_id
         response = index.query(
-            vector=[0.0] * 384,  # dummy vector just to activate filter
+            vector=[0.0] * 384,
             top_k=500,
             include_metadata=True,
             filter={
