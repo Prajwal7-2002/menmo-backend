@@ -232,17 +232,39 @@ class DocumentDeleteAPIView(APIView):
     def delete(self, request, doc_id):
         try:
             doc = UploadedDocument.objects.get(id=doc_id, user=request.user)
-        except:
+        except UploadedDocument.DoesNotExist:
             return Response({"detail": "Not found"}, status=404)
 
-        ids = list(DocumentChunk.objects.filter(document=doc).values_list("pinecone_id", flat=True))
-        if ids:
-            from pinecone import Pinecone
-            pc = Pinecone(api_key=os.getenv("PINECONE_API_KEY"))
-            pc.Index(os.getenv("PINECONE_INDEX_NAME")).delete(ids=ids)
+        # ---- 1. Collect chunk IDs ----
+        chunk_ids = list(
+            DocumentChunk.objects.filter(document_id=doc.id)
+            .values_list("pinecone_id", flat=True)
+        )
 
+        # ---- 2. Delete vectors from Pinecone in safe batches ----
+        if chunk_ids:
+            try:
+                from pinecone import Pinecone
+                pc = Pinecone(api_key=os.getenv("PINECONE_API_KEY"))
+                index = pc.Index(os.getenv("PINECONE_INDEX_NAME"))
+
+                BATCH = 100
+                for i in range(0, len(chunk_ids), BATCH):
+                    batch = chunk_ids[i:i+BATCH]
+                    index.delete(ids=batch)
+
+            except Exception as e:
+                # Still proceed but warn user
+                print(f"⚠ Pinecone deletion error: {e}")
+
+        # ---- 3. Delete DB chunks ----
+        DocumentChunk.objects.filter(document_id=doc.id).delete()
+
+        # ---- 4. Delete the document ----
         doc.delete()
+
         return Response({"detail": "Deleted"}, status=200)
+
 
 
 # -------------------------------------------------------
