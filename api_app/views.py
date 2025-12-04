@@ -1,4 +1,13 @@
-# api_app/views.py (FINAL patched — Agent-driven RAG orchestration)
+# api_app/views.py
+"""
+Final patched API views.
+
+Key changes:
+- When creating agents or calling agent.run, always pass domain & document_id.
+- Document deletion clears Pinecone vectors and calls memory.clear_memory_for_document.
+- Conversation endpoints pass domain/document_id into agent build.
+- Defensive: all external calls wrapped with try/except and warnings.
+"""
 
 import os
 import json
@@ -25,13 +34,13 @@ from rag.memory import (
     store_conversation_turn,
     load_vector_memory,
     add_memory_fact,
-    relevant_chunks
+    relevant_chunks,
+    clear_memory_for_document,
 )
 
 from api_app.models import Conversation, Message
 from rag.tools.intent_classifier import classify_intent_and_route
 from rag.llm import call_llm_answer
-
 
 # ------------------------
 # Small helpers
@@ -45,6 +54,7 @@ def safe_text(value: Any) -> str:
         except Exception:
             return str(value)
     return str(value)
+
 
 def normalize_agent_output(agent_output: Any) -> Dict[str, Any]:
     if agent_output is None:
@@ -72,6 +82,7 @@ class AskAPIView(APIView):
         user = request.user
         query = serializer.validated_data["query"].strip()
         mood = request.data.get("mood", "neutral")
+        # Domain stored in session; document_id can be provided by frontend
         domain = request.session.get("active_domain")
         document_id = request.data.get("document_id")
         memory = load_vector_memory(user, query)
@@ -110,7 +121,7 @@ class AskAPIView(APIView):
 
         # MEMORY RECALL via agent
         if intent == "memory_recall":
-            agent = build_agent(user_id=user.id, domain=domain, document_id=document_id, mood=mood, history=memory, agent_enabled=True)
+            agent = build_agent(user_id=user.id, domain=domain, document_id=document_id, allow_web=False, agent_enabled=True)
             agent_raw = agent.run(query)
             agent_res = normalize_agent_output(agent_raw)
             final_text = safe_text(agent_res["answer"])
@@ -126,16 +137,15 @@ class AskAPIView(APIView):
 
         # DOCUMENT question -> AGENT-driven RAG
         if intent == "doc":
-            # Let the agent orchestrate retrieval/rewrite/retry
-            agent = build_agent(user_id=user.id, domain=domain, document_id=document_id, mood=mood, history=memory, agent_enabled=True)
+            agent = build_agent(user_id=user.id, domain=domain, document_id=document_id, allow_web=True, agent_enabled=True)
             agent_res = agent.run(query)
             final_ans = safe_text(agent_res.get("answer", ""))
             store_conversation_turn(user, query, final_ans)
             QueryLog.objects.create(user=user, query=query, top_score=agent_res.get("confidence", 0.0), chunks=agent_res.get("chunks", []))
             return Response({"answer": final_ans, "mode": "agent", "confidence": float(agent_res.get("confidence", 0.0)), "chunks": agent_res.get("chunks", []), "trace": agent_res.get("trace", [])})
 
-        # Default: let the Agent orchestrate RAG + retries
-        agent = build_agent(user_id=user.id, domain=domain, document_id=document_id, mood=mood, history=memory, agent_enabled=True)
+        # Default: Agent orchestrates RAG + retries
+        agent = build_agent(user_id=user.id, domain=domain, document_id=document_id, allow_web=True, agent_enabled=True)
         agent_res = agent.run(query)
         final_ans = safe_text(agent_res.get("answer", ""))
         store_conversation_turn(user, query, final_ans)
@@ -260,11 +270,16 @@ class DocumentDeleteAPIView(APIView):
         # ---- 3. Delete DB chunks ----
         DocumentChunk.objects.filter(document_id=doc.id).delete()
 
+        # ---- 3.5 Clear any vector-memory related to this document
+        try:
+            clear_memory_for_document(user_id=request.user.id, document_id=str(doc.id))
+        except Exception as e:
+            print(f"⚠ clear_memory_for_document failed: {e}")
+
         # ---- 4. Delete the document ----
         doc.delete()
 
         return Response({"detail": "Deleted"}, status=200)
-
 
 
 # -------------------------------------------------------
@@ -341,21 +356,8 @@ class ConversationChatAPIView(APIView):
             QueryLog.objects.create(user=request.user, query=query, top_score=0, chunks=[])
             return Response({"answer": answer, "mode": "chat", "confidence": float(route.get("confidence", 0.9)), "chunks": []})
 
-        # AGENT MODE (explicit toggle) — respect agent_mode if provided
-        if agent_mode:
-            agent = build_agent(user_id=request.user.id, domain=domain, document_id=doc_id, mood=mood, history=memory, agent_enabled=True)
-            agent_raw = agent.run(query)
-            agent_res = normalize_agent_output(agent_raw)
-            final_text = safe_text(agent_res["answer"])
-
-            Message.objects.create(conversation=conv, role="user", content=query)
-            Message.objects.create(conversation=conv, role="assistant", content=final_text)
-            store_conversation_turn(request.user, query, final_text)
-            QueryLog.objects.create(user=request.user, query=query, top_score=agent_res.get("confidence", 0.0), chunks=agent_res.get("chunks", []))
-            return Response(agent_res)
-
-        # Default: Agent orchestrates for document/knowledge queries (agent decides retrieval/web/rewrite)
-        agent = build_agent(user_id=request.user.id, domain=domain, document_id=doc_id, mood=mood, history=memory, agent_enabled=True)
+        # Use agent with domain/document context ALWAYS
+        agent = build_agent(user_id=request.user.id, domain=domain, document_id=doc_id, allow_web=True, agent_enabled=True)
         agent_raw = agent.run(query)
         agent_res = normalize_agent_output(agent_raw)
         final_text = safe_text(agent_res["answer"])

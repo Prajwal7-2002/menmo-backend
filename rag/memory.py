@@ -1,15 +1,24 @@
-# rag/memory.py  -> Hybrid Memory System (Conversation + Facts)
+# rag/memory.py  -> Clean, Isolated Memory System (Conversation + Facts)
 
-import os, uuid
+import os
+import uuid
 from typing import List, Dict, Any
+
 from pinecone import Pinecone
 
-# Pinecone config
+# ==========================================================
+# ENV CONFIG
+# ==========================================================
 PINECONE_API_KEY = os.getenv("PINECONE_API_KEY")
-INDEX_NAME       = os.getenv("PINECONE_INDEX_NAME")
+
+# 🔥 DOCUMENT VECTOR INDEX (kept separate)
+DOC_INDEX = os.getenv("PINECONE_INDEX_NAME", "neurostack-rag")
+
+# 🔥 MEMORY INDEX (completely isolated)
+MEMORY_INDEX = os.getenv("PINECONE_MEMORY_INDEX", "neurostack-memory")
 
 # ==========================================================
-# INTERNAL: Load embedding model lazily
+# INTERNAL: Lazy embedding model
 # ==========================================================
 _embedder = None
 def get_embedder():
@@ -21,51 +30,57 @@ def get_embedder():
 
 
 # ==========================================================
-# 1️⃣  CONVERSATION MEMORY (Existing Feature)
+# INTERNAL: Pinecone memory index connection
 # ==========================================================
+def get_memory_index():
+    if not PINECONE_API_KEY:
+        raise RuntimeError("Missing PINECONE_API_KEY")
+    pc = Pinecone(api_key=PINECONE_API_KEY)
+    return pc.Index(MEMORY_INDEX)
 
+
+# ==========================================================
+# 1️⃣  CONVERSATION MEMORY
+# ==========================================================
 def store_conversation_turn(user, query: str, answer: str):
     """
-    Store chat history as vector memory.
+    Store conversation history as memory vectors in a SEPARATE index.
+    Never stored in document index.
     """
     try:
-        model = get_embedder()
         text = f"user:{query}\nassistant:{answer}"
-        vec = model.encode(text).tolist()
+        vec = get_embedder().encode(text).tolist()
 
-        pc = Pinecone(api_key=PINECONE_API_KEY)
-        index = pc.Index(INDEX_NAME)
-
+        index = get_memory_index()
         index.upsert([{
             "id": f"conv-{user.id}-{uuid.uuid4()}",
             "values": vec,
             "metadata": {
-                "type":"conversation",
-                "user":str(user.id),
-                "text":text
+                "type": "conversation",
+                "user": str(user.id),
+                "text": text
             }
         }])
 
     except Exception as e:
-        print("❌ Failed storing conversation vector:", e)
+        print("❌ Failed storing conversation memory:", e)
 
 
-def load_vector_memory(user, query: str, top_k: int = 6) -> List[Dict[str, str]]:
+
+def load_vector_memory(user, query: str, top_k: int = 6) -> List[Dict[str, Any]]:
     """
-    Retrieve past conversation for chat continuity.
+    Retrieve conversation memory. 
+    ONLY searches memory index. Never touches document index.
     """
     try:
-        model = get_embedder()
-        q_vec = model.encode(query).tolist()
+        q_vec = get_embedder().encode(query).tolist()
 
-        pc = Pinecone(api_key=PINECONE_API_KEY)
-        index = pc.Index(INDEX_NAME)
-
+        index = get_memory_index()
         response = index.query(
             vector=q_vec,
             top_k=top_k,
             include_metadata=True,
-            filter={"type":"conversation", "user":str(user.id)}
+            filter={"type": "conversation", "user": str(user.id)}
         )
 
         messages = []
@@ -76,10 +91,8 @@ def load_vector_memory(user, query: str, top_k: int = 6) -> List[Dict[str, str]]
             txt = m["metadata"]["text"]
             if "\nassistant:" in txt:
                 u, a = txt.split("\nassistant:")
-                u = u.replace("user:", "").strip()
-                a = a.strip()
-                messages.append({"role": "user",      "content": u})
-                messages.append({"role": "assistant", "content": a})
+                messages.append({"role": "user", "content": u.replace("user:", "").strip()})
+                messages.append({"role": "assistant", "content": a.strip()})
 
         return messages
 
@@ -89,35 +102,53 @@ def load_vector_memory(user, query: str, top_k: int = 6) -> List[Dict[str, str]]
 
 
 # ==========================================================
-# 2️⃣  FACT MEMORY (NEW) – Clean, Persistent, Deduped
+# 2️⃣  FACT MEMORY (Long-term memory)
 # ==========================================================
+def _fact_id(user):
+    return f"fact-{user.id}-{uuid.uuid4().hex}"
 
-def _fact_id(user, text):
-    return "fact-" + str(user.id) + "-" + uuid.uuid4().hex
+
+def memory_exists(user, text: str) -> bool:
+    """Check if fact already exists (semantic dedupe)."""
+    try:
+        q_vec = get_embedder().encode(text).tolist()
+
+        index = get_memory_index()
+        response = index.query(
+            vector=q_vec,
+            top_k=5,
+            include_metadata=True,
+            filter={"type": "memory_fact", "user": str(user.id)}
+        )
+
+        for m in response.get("matches", []):
+            stored = m["metadata"]["text"].strip().lower()
+            if stored == text.strip().lower():
+                return True
+
+        return False
+
+    except Exception:
+        return False
+
 
 
 def add_memory_fact(user, text: str) -> bool:
-    """
-    Store a clean memory fact (not a conversation turn).
-    Deduped properly. Stored in Pinecone.
-    """
+    """Store long-term memory fact (clean & deduped)."""
     try:
         text = text.strip()
         if not text:
             return False
 
-        # Check duplicates
+        # Deduplicate
         if memory_exists(user, text):
             return False
 
-        model = get_embedder()
-        vec = model.encode(text).tolist()
+        vec = get_embedder().encode(text).tolist()
 
-        pc = Pinecone(api_key=PINECONE_API_KEY)
-        index = pc.Index(INDEX_NAME)
-
+        index = get_memory_index()
         index.upsert([{
-            "id": _fact_id(user, text),
+            "id": _fact_id(user),
             "values": vec,
             "metadata": {
                 "type": "memory_fact",
@@ -133,50 +164,18 @@ def add_memory_fact(user, text: str) -> bool:
         return False
 
 
-def memory_exists(user, text: str) -> bool:
-    """
-    Check if a memory fact already exists for dedupe.
-    """
-    try:
-        model = get_embedder()
-        q_vec = model.encode(text).tolist()
-
-        pc = Pinecone(api_key=PINECONE_API_KEY)
-        index = pc.Index(INDEX_NAME)
-
-        response = index.query(
-            vector=q_vec,
-            top_k=5,
-            include_metadata=True,
-            filter={"type": "memory_fact", "user": str(user.id)}
-        )
-
-        for m in response.get("matches", []):
-            stored = m["metadata"]["text"].strip().lower()
-            if stored == text.strip().lower():
-                return True
-
-        return False
-    except:
-        return False
-
-
 # ==========================================================
-# 3️⃣  FACT MEMORY RECALL (NEW)
+# 3️⃣  MEMORY FACT RECALL
 # ==========================================================
-
 def relevant_chunks(user, query: str, top_k: int = 4):
     """
-    Retrieve FACT memory (not conversation memory).
-    Used by agentic_answer for reasoning.
+    Retrieve long-term memory. 
+    NEVER hits RAG vector index.
     """
     try:
-        model = get_embedder()
-        q_vec = model.encode(query).tolist()
+        q_vec = get_embedder().encode(query).tolist()
 
-        pc = Pinecone(api_key=PINECONE_API_KEY)
-        index = pc.Index(INDEX_NAME)
-
+        index = get_memory_index()
         response = index.query(
             vector=q_vec,
             top_k=top_k,
