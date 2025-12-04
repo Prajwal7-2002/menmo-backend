@@ -130,8 +130,10 @@ class AgenticRAG:
 
             # 2) RAG retrieval
             try:
-                rag_payload = json.dumps({"query": refined_query, "user_id": self.user_id})
-                chunks = tool_rag(rag_payload) or []
+                rag_payload = json.dumps({ "query": refined_query,"user_id": self.user_id,"domain": getattr(self, "domain", None),"document_id": getattr(self, "document_id", None)
+                    })
+                chunks = tool_rag(rag_payload)
+
                 # ensure chunks are list-like when returned by rag_search wrapper
                 if isinstance(chunks, dict) and chunks.get("chunks"):
                     chunks = chunks.get("chunks")
