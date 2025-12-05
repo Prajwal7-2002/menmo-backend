@@ -1,55 +1,65 @@
-# pipeline.py
+# rag/pipeline.py
 from typing import Optional, Dict, Any, List
 import logging
 
 from .retrieval import retrieve_with_conf, is_confident_enough
 from .llm import call_llm_answer
-from api_app.models import QueryLog
+from .tools.evaluate_context import evaluate_context_tool
+from .tools.rag_search import rag_search
+from .tools.fallback_llm import fallback_llm_tool
 
 logger = logging.getLogger(__name__)
 
-def _log_and_response(query: str, answer: str, chunks: List[Dict[str,Any]], top_score: float, validated: bool=False):
-    log = QueryLog.objects.create(query=query, answer=answer, top_score=top_score, chunks=chunks)
-    return {"answer": answer, "validated": validated, "confidence": float(top_score or 0.0), "chunks": chunks, "query_id": str(log.id), "top_score": float(top_score or 0.0)}
+REPHRASE_MSG = "I don’t know based on the available documentation. Please rephrase or ask something more specific."
+
+# overall threshold used as a last resort
+MIN_ACCEPT_CONF = float(__import__("os").environ.get("MIN_ACCEPT_CONF", 0.18))
+
+def _log_and_response(query: str, answer: str, chunks: List[Dict[str, Any]], top_score: float, validated: bool=False):
+    # preserve previous QueryLog behavior if you have it; else return dict
+    try:
+        from api_app.models import QueryLog
+        log = QueryLog.objects.create(query=query, answer=answer, top_score=top_score, chunks=chunks)
+        qid = str(log.id)
+    except Exception:
+        qid = None
+    return {"answer": answer, "validated": validated, "confidence": float(top_score or 0.0), "chunks": chunks, "query_id": qid}
 
 def run_rag(query: str, user_id: Optional[int] = None, domain: Optional[str] = None,
             document_id: Optional[str] = None, mood: str = "neutral", history: Optional[List[Dict[str, str]]] = None,
             max_chunks: int = 4) -> Dict[str, Any]:
     """
-    Retrieval -> gating -> LLM answer flow.
-    Returns diagnostic fields: answer, validated (bool), confidence (float), chunks (list), top_score (float)
+    Retrieval -> context evaluation -> LLM answer flow.
+    Uses evaluate_context_tool to accept/reject retrieval results.
     """
-    # Retrieve with diagnostics
-    chunks, scores, conf = retrieve_with_conf(query, user_id, domain, document_id, top_k=max_chunks * 2)
+
+    # 1) retrieve candidates (with diagnostic score)
+    chunks, scores, conf = retrieve_with_conf(query, user_id=user_id, domain=domain, document_id=document_id, top_k=max_chunks * 2)
     if not chunks:
-        return _log_and_response(query, "", [], 0.0, validated=False)
+        # as a last resort call fallback llm with available minimal context
+        fallback = fallback_llm_tool(query, context="")
+        return _log_and_response(query, fallback, [], 0.0, validated=False)
 
-    candidates = chunks
-    top = candidates[0]
-    text = top.get("text", "").strip()
-    text_len = len(text)
-    bm25_norm = float(top.get("bm25_score_norm") or top.get("bm25_norm") or 0.0)
-    top_score = float(top.get("score") or 0.0)
+    chosen = chunks[:max_chunks]
+    # evaluate the retrieval context quality
+    eval_result = evaluate_context_tool(chosen)
+    logger.info("run_rag: retrieval_conf=%s eval=%s", conf, eval_result)
 
-    logger.info(f"run_rag: conf={conf:.4f}  top_text_len={text_len}  bm25_norm={bm25_norm:.4f} top_score={top_score:.4f}")
-
-    # RELAXED GATING
-    # RELAXED GATING FOR SMALL DOCS
-    if conf >= 0.15:
+    # Accept if retrieval confidence OR evaluator says 'good'
+    accepted = False
+    if eval_result.get("quality") == "good":
         accepted = True
-    else:
-        if (text_len >= 5) or (bm25_norm >= 0.10) or (top_score >= 0.10):
-            accepted = True
-
+    elif is_confident_enough(conf) or float(conf or 0.0) >= float(MIN_ACCEPT_CONF):
+        accepted = True
 
     if not accepted:
-        logger.info("run_rag: gating rejected (insufficient confidence/bm25/text_len)")
-        # Still return candidates for the agent to inspect in its trace
-        return _log_and_response(query, "", candidates[:max_chunks], float(top_score), validated=False)
+        # not safe to ground LLM — fallback to short safe answer via fallback_llm
+        context = "\n\n---\n\n".join(c.get("text","") for c in chosen)
+        fallback = fallback_llm_tool(query, context=context)
+        return _log_and_response(query, fallback, chosen, float(conf or 0.0), validated=False)
 
-    # build context
-    chosen = candidates[:max_chunks]
-    context = "\n\n---\n\n".join([c.get("text", "") for c in chosen])
+    # build context (optionally prepend history)
+    context = "\n\n---\n\n".join([c.get("text","") for c in chosen])
     if history:
         try:
             memory = "\n".join(f"{m['role']}: {m['content']}" for m in history if isinstance(m, dict) and m.get('content'))
@@ -58,13 +68,12 @@ def run_rag(query: str, user_id: Optional[int] = None, domain: Optional[str] = N
         except Exception:
             pass
 
-    # final LLM
+    # final LLM call
     try:
         answer = call_llm_answer(question=query, context=context, mood=mood)
-        final = answer.strip() if answer else (chosen[0]["text"] if chosen else "")
+        final = answer.strip() if answer else (chosen[0]["text"] if chosen else REPHRASE_MSG)
     except Exception as e:
-        logger.exception("run_rag: final LLM answer failed: %s", e)
-        final = chosen[0]["text"] if chosen else ""
+        logger.exception("run_rag: final LLM failed: %s", e)
+        final = chosen[0]["text"] if chosen else REPHRASE_MSG
 
-    # return diagnostics and normalized fields
-    return _log_and_response(query, final, chosen, top_score=float(top_score), validated=True)
+    return _log_and_response(query, final, chosen, float(conf or 0.0), validated=True)

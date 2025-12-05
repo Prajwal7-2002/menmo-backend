@@ -1,63 +1,35 @@
 # rag/tools/fallback_llm.py
 from rag.llm import call_llm_answer
 
-def fallback_llm_tool(query: str, context: str = "") -> str:
+def fallback_llm_tool(query: str, context: str = "", domain=None, document_id=None) -> str:
     """
-    A safe fallback that ALWAYS returns a short, clean text answer.
-    Used when planner cannot pick a valid tool or when memory needs summarization.
+    FINAL fallback that ALWAYS grounds the answer strictly to retrieved chunks.
+    Zero hallucinations. Zero template guessing.
     """
-    # ---- 1. Detect memory context more reliably ----
-    is_memory = False
-    if context:
-        lowered = context.lower()
-        if any(k in lowered for k in ["memory", "fact:", "stored", "recall"]):
-            is_memory = True
 
-    # ---- 2. Build minimal prompt (VERY IMPORTANT) ----
-    if is_memory:
-        system_instruction = (
-            "You are summarizing the user's stored memories. "
-            "Return ONE short sentence using those memories as evidence. "
-            "Do not hallucinate. If unsure, say: 'I don't know based on the memory.'"
-        )
-    else:
-        system_instruction = (
-            "Provide a short, helpful answer. "
-            "If the user greets you (hi, hello, hey), respond naturally. "
-            "Never answer with an empty string. "
-            "If unsure, say: 'I'm not sure, but I can help if you clarify.'"
-        )
+    SYSTEM = (
+        "You are a RAG assistant. Answer STRICTLY using the provided context. "
+        "Do NOT generalize. Do NOT infer missing sections. "
+        "If the context doesn’t contain enough information, say explicitly:\n"
+        "\"The context does not contain enough information to answer this question.\"\n"
+        "Never produce template-like answers such as introductions, purposes, or assumptions "
+        "unless the text explicitly appears in the retrieved chunks."
+    )
 
-    # ---- 3. Build context ----
-    compact_context = f"{system_instruction}\n\nContext:\n{context or 'None'}"
+    # Build strict prompt
+    final_context = f"{SYSTEM}\n\n---BEGIN-CONTEXT---\n{context}\n---END-CONTEXT---"
 
-    # ---- 4. Try generating ----
     try:
-        result = call_llm_answer(
+        answer = call_llm_answer(
             question=query,
-            context=compact_context,
-            mood="friendly",
-            max_tokens=100
+            context=final_context,
+            max_tokens=200,
+            mood="neutral"
         )
     except Exception:
-        return "I'm here to help — can you clarify that?"
+        return "The context does not contain enough information to answer this question."
 
-    # ---- 5. Clean & normalize output ----
-    if not result or not str(result).strip():
-        return "I'm here to help — can you rephrase that?"
+    if not answer or not answer.strip():
+        return "The context does not contain enough information to answer this question."
 
-    text = str(result).strip()
-
-    # remove stray JSON formatting or quotes
-    if text.startswith("{") or text.startswith("["):
-        try:
-            import json
-            parsed = json.loads(text)
-            if isinstance(parsed, dict):
-                text = parsed.get("answer") or parsed.get("message") or str(parsed)
-            else:
-                text = str(parsed)
-        except Exception:
-            pass  # fallback to text
-
-    return text
+    return answer.strip()
