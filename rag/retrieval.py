@@ -1,8 +1,7 @@
-# rag/retrieval.py
 import os
 import logging
 import re
-from typing import List, Dict, Any, Optional, Tuple
+from typing import List, Dict, Any, Optional
 
 import numpy as np
 from rank_bm25 import BM25Okapi
@@ -31,7 +30,7 @@ USE_QUERY_REWRITE = str(os.getenv("USE_QUERY_REWRITE", "false")).lower() in ("1"
 RERANKER_MODEL = os.getenv("RERANKER_MODEL", "cross-encoder/ms-marco-MiniLM-L6-v2")
 
 MIN_HYBRID_CONF = float(os.getenv("MIN_HYBRID_CONF", "0.15"))
-MIN_TEXT_LEN = int(os.getenv("MIN_TEXT_LEN", "40"))  # lowered so short headings can pass
+MIN_TEXT_LEN = int(os.getenv("MIN_TEXT_LEN", "40"))
 ALLOW_RELAXED_FALLBACK = str(os.getenv("ALLOW_RELAXED_FALLBACK", "true")).lower() in ("1", "true", "yes")
 
 # Internal caches
@@ -40,12 +39,14 @@ _reranker = None
 
 # ---------------------- Helpers ----------------------
 
+
 def _get_pinecone_index():
     if not PINECONE_API_KEY:
         raise RuntimeError("PINECONE_API_KEY not set")
     from pinecone import Pinecone
     pc = Pinecone(api_key=PINECONE_API_KEY)
     return pc.Index(PINECONE_INDEX_NAME)
+
 
 def _get_embedder():
     global _embedder
@@ -59,6 +60,7 @@ def _get_embedder():
         _embedder = SentenceTransformer(HF_EMBED_MODEL)
     return _embedder
 
+
 def embed_texts(texts: List[str]) -> List[List[float]]:
     if not texts:
         return []
@@ -71,23 +73,34 @@ def embed_texts(texts: List[str]) -> List[List[float]]:
         logger.error("embed_texts(): embedder failed: %s", e)
         return [[0.01] * EMBED_DIM for _ in texts]
 
+
 def _extract_text(meta: Dict[str, Any]) -> str:
     txt = (meta or {}).get("chunk_text") or (meta or {}).get("full_text") or (meta or {}).get("snippet") or ""
     txt = re.sub(r'[\x00-\x1f\x7f]+', ' ', txt)
     txt = re.sub(r'\s{2,}', ' ', txt).strip()
     return txt
 
+
 def _build_filter(user_id: Optional[int], domain: Optional[str], document_id: Optional[str]) -> Dict[str, Any]:
+    """
+    Build Pinecone metadata filter.
+    We intentionally ignore user_id here so that docs are shared across the same index.
+    If document_id is provided, we filter only on document_id (domain is implicit).
+    Otherwise, we filter on domain when available.
+    """
     flt: Dict[str, Any] = {}
-    if user_id is not None:
-        flt["user_id"] = str(user_id)
-    if domain:
-        flt["domain"] = str(domain).lower()
+    # if user_id is not None:
+    #     flt["user_id"] = str(user_id)
     if document_id:
         flt["document_id"] = str(document_id)
+        return flt
+    if domain:
+        flt["domain"] = str(domain).lower()
     return flt
 
+
 # ---------------------- Pinecone query / retrieval ----------------------
+
 
 def query_vectors(query_text: str,
                   user_id: Optional[int] = None,
@@ -115,6 +128,7 @@ def query_vectors(query_text: str,
 
     try:
         if flt:
+            # try with filter; if error, try unfiltered fallback
             res = index.query(vector=q_vec, top_k=top_k, include_metadata=True, filter=flt)
         else:
             res = index.query(vector=q_vec, top_k=top_k, include_metadata=True)
@@ -156,12 +170,13 @@ def query_vectors(query_text: str,
         output.append({"id": mid, "text": txt, "score": score, "meta": meta})
     return output
 
+
 def retrieve(query: str,
              user_id: Optional[int] = None,
              domain: Optional[str] = None,
              document_id: Optional[str] = None,
              top_k: int = TOP_K_DEFAULT) -> List[Dict[str, Any]]:
-    logger.info("retrieve(): q=%s...", query[:140])
+    logger.info("retrieve(): q=%s...", (query or "")[:140])
     effective_query = query
 
     if USE_QUERY_REWRITE:
@@ -183,26 +198,36 @@ def retrieve(query: str,
     if not dense:
         return []
 
-    # Strict filtering by domain/document_id
+    # Strict filtering by domain/document_id only if provided
     if domain or document_id:
         strict_filtered = []
         for d in dense:
             meta = (d.get("meta") or {}) or {}
             meta_domain = str(meta.get("domain", "")).lower()
             meta_docid = str(meta.get("document_id", ""))
-            if domain and meta_domain != str(domain).lower():
-                continue
-            if document_id and meta_docid != str(document_id):
-                continue
+            # For strict document queries, only enforce document_id match.
+            if document_id is not None:
+                if meta_docid != str(document_id):
+                    continue
+            else:
+                if domain and meta_domain != str(domain).lower():
+                    continue
             strict_filtered.append(d)
 
-        if (domain or document_id) and not strict_filtered:
-            logger.info("retrieve(): strict filter matched 0 candidates")
+        # If a specific document_id was requested and nothing matches, HARD STOP:
+        # do not leak into other documents even if ALLOW_RELAXED_FALLBACK is true.
+        if document_id and not strict_filtered:
+            logger.info("retrieve(): strict filter (document_id) matched 0 candidates -> returning []")
+            return []
+
+        # If only domain is provided (no document_id), we may optionally relax.
+        if domain and not document_id and not strict_filtered:
+            logger.info("retrieve(): strict domain filter matched 0 candidates")
             if ALLOW_RELAXED_FALLBACK:
                 logger.info("retrieve(): ALLOW_RELAXED_FALLBACK enabled — using unfiltered set")
             else:
                 return []
-        else:
+        elif strict_filtered:
             dense = strict_filtered
 
     # Filter out trivially short chunks, but keep set if none are >= MIN_TEXT_LEN
@@ -287,9 +312,6 @@ def retrieve(query: str,
     return combined[:top_k]
 
 
-# upsert_vectors, scan_missing_metadata, delete_vectors_by_ids unchanged...
-
-
 def upsert_vectors(items: List[Dict[str, Any]], batch_size: int = 100):
     try:
         index = _get_pinecone_index()
@@ -303,6 +325,7 @@ def upsert_vectors(items: List[Dict[str, Any]], batch_size: int = 100):
         except Exception as e:
             logger.error(f"upsert_vectors(): batch upsert failed: {e}")
 
+
 def retrieve_with_conf(query, user_id=None, domain=None, document_id=None, top_k=TOP_K_DEFAULT):
     chunks = retrieve(query, user_id, domain, document_id, top_k)
     if not chunks:
@@ -310,6 +333,7 @@ def retrieve_with_conf(query, user_id=None, domain=None, document_id=None, top_k
     scores = [c["score"] for c in chunks]
     conf = max(scores) if scores else 0.0
     return chunks, scores, conf
+
 
 def is_confident_enough(confidence: float) -> bool:
     try:

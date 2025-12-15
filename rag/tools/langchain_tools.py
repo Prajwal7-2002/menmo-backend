@@ -1,14 +1,3 @@
-# rag/tools/langchain_tools.py
-"""
-LangChain tool wrappers and WrappedLLM.
-
-Key changes:
-- tool_rag now expects/forwards domain and document_id from JSON payload.
-- tool_memory and tool_web accept JSON payload strings and forward domain/document_id.
-- get_langchain_tools builds LangChain Tool objects as before but tools expect JSON input with domain/document_id.
-- WrappedLLM._generate ensures system prompt enforces RAG-first policy.
-"""
-
 from typing import Any, Dict, List
 import json
 import logging
@@ -37,7 +26,6 @@ except Exception:
     ChatResult = ChatGeneration = object
     LANGCHAIN_AVAILABLE = False
 
-# ---------------- Wrapped LLM ----------------
 class WrappedLLM(BaseChatModel):
     model_name = "groq_react_chat"
 
@@ -48,7 +36,6 @@ class WrappedLLM(BaseChatModel):
     def _convert_messages(self, messages):
         result = []
         for m in messages:
-            # Messages may be dict-like or langchain message types
             try:
                 mrole = getattr(m, "type", None) or getattr(m, "role", None)
                 content = getattr(m, "content", None) or str(m)
@@ -64,7 +51,6 @@ class WrappedLLM(BaseChatModel):
 
     def _generate(self, messages, stop=None, **kwargs):
         msgs = self._convert_messages(messages)
-        # Enforce RAG-first guard
         msgs.insert(0, {
             "role": "system",
             "content": (
@@ -87,14 +73,7 @@ class WrappedLLM(BaseChatModel):
         return res.generations[0].message.content
 
 
-# ---------------- Tool wrappers ----------------
-
 def tool_rag(input_str: str) -> Dict[str, Any]:
-    """
-    input_str should be JSON with fields:
-      { "query": "...", "user_id": ..., "domain": "...", "document_id": "..." }
-    Returns rag_search(...) result (dict).
-    """
     try:
         payload = json.loads(input_str)
         return rag_search(
@@ -102,16 +81,17 @@ def tool_rag(input_str: str) -> Dict[str, Any]:
             user_id=payload.get("user_id"),
             domain=payload.get("domain"),
             document_id=payload.get("document_id"),
+            max_chunks=payload.get("max_chunks", 4)
         )
     except Exception:
         # fallback: treat input as raw query (no domain/document)
-        return rag_search(input_str, None, None, None)
+        try:
+            return rag_search(input_str, None, None, None, max_chunks=4)
+        except Exception:
+            return {"found": False, "chunks": [], "context": "", "confidence": 0.0}
 
 
 def tool_memory(input_str: str, user_obj=None) -> Any:
-    """
-    Expects JSON {"query": "...", "domain": "...", "document_id": "..."} or raw query.
-    """
     try:
         payload = json.loads(input_str)
         return memory_search_tool(user=user_obj, query=payload.get("query", ""), domain=payload.get("domain"), document_id=payload.get("document_id"))
@@ -121,7 +101,9 @@ def tool_memory(input_str: str, user_obj=None) -> Any:
 
 def tool_rewrite(input_str: str) -> str:
     """
-    Expects JSON {"query": "...", "context_chunks": [...], "domain": "...", "document_id": "..."} or raw query.
+    Lightweight wrapper around rewrite_query_tool.
+    Accepts JSON: {query, context_chunks, domain, document_id} or raw string.
+    If parsing fails, returns a conservative rewrite of the raw string.
     """
     try:
         payload = json.loads(input_str)
@@ -132,13 +114,11 @@ def tool_rewrite(input_str: str) -> str:
             document_id=payload.get("document_id"),
         )
     except Exception:
+        # Last resort: treat input_str itself as the query text
         return rewrite_query_tool(query=input_str, context_chunks=[])
 
 
 def tool_fallback(input_str: str) -> str:
-    """
-    Expects JSON {"query": "...", "context": "...", "domain":"...", "document_id":"..."} or raw query.
-    """
     try:
         payload = json.loads(input_str)
         return fallback_llm_tool(query=payload.get("query", ""), context=payload.get("context", ""), domain=payload.get("domain"), document_id=payload.get("document_id"))
@@ -147,19 +127,34 @@ def tool_fallback(input_str: str) -> str:
 
 
 def tool_web(input_str: str) -> Any:
-    # expects JSON {"query": "..."} or raw
     try:
         payload = json.loads(input_str)
-        return web_search_tool(payload.get("query", ""))
+        query = payload.get("query", "")
     except Exception:
-        return web_search_tool(input_str)
+        query = input_str
+
+    try:
+        external_results = web_search_tool(query, max_results=4)
+        return {
+            "found": len(external_results) > 0,
+            "chunks": [
+                {
+                    "text": r.get("body") or r.get("title") or "",
+                    "meta": {"source": r.get("href", "")},
+                    "score": 0.0,
+                }
+                for r in external_results
+            ],
+            "context": "\n\n---\n\n".join((r.get("body") or r.get("title") or "") for r in external_results),
+            "confidence": 0.5,
+            "filtered_match": False,
+        }
+    except Exception as e:
+        logger.exception("tool_web failed: %s", e)
+        return {"found": False, "chunks": [], "context": "", "confidence": 0.0}
 
 
 def tool_evaluate(input_str: str) -> Dict[str, Any]:
-    """
-    Accepts JSON list of chunks or a JSON string: {"chunks": [...]}
-    Returns evaluate_context_tool output.
-    """
     try:
         p = json.loads(input_str)
         chunks = p if isinstance(p, list) else p.get("chunks", []) or []
@@ -168,13 +163,7 @@ def tool_evaluate(input_str: str) -> Dict[str, Any]:
     return evaluate_context_tool(chunks)
 
 
-# ---------------- Registry builder (allow_web control) ----------------
-
 def get_langchain_tools(user_obj=None, allow_web: bool = True):
-    """
-    Returns LangChain Tool list or fallback dict depending on availability.
-    Tools expect JSON strings as input so agent can include domain/document_id.
-    """
     if not LANGCHAIN_AVAILABLE:
         tools = {
             "rag_search": tool_rag,

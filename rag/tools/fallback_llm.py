@@ -1,22 +1,24 @@
 # rag/tools/fallback_llm.py
 from rag.llm import call_llm_answer
 
+
 def fallback_llm_tool(query: str, context: str = "", domain=None, document_id=None) -> str:
     """
-    FINAL fallback that ALWAYS grounds the answer strictly to retrieved chunks.
-    Zero hallucinations. Zero template guessing.
+    Fallback LLM that prefers retrieved context but can use general knowledge
+    when the context is weak or incomplete.
     """
 
     SYSTEM = (
-        "You are a RAG assistant. Answer STRICTLY using the provided context. "
-        "Do NOT generalize. Do NOT infer missing sections. "
-        "If the context doesn’t contain enough information, say explicitly:\n"
-        "\"The context does not contain enough information to answer this question.\"\n"
-        "Never produce template-like answers such as introductions, purposes, or assumptions "
-        "unless the text explicitly appears in the retrieved chunks."
+        "You are a RAG assistant.\n"
+        "- Prefer to answer using the provided context.\n"
+        "- If the context is clearly unrelated to the question or missing key information,\n"
+        "  you may use your general knowledge to answer, but do not contradict anything\n"
+        "  that appears in the context.\n"
+        "- If you truly cannot answer even with general knowledge, say exactly:\n"
+        "  \"The context does not contain enough information to answer this question.\""
     )
 
-    # Build strict prompt
+    # Build prompt with system instructions plus raw context
     final_context = f"{SYSTEM}\n\n---BEGIN-CONTEXT---\n{context}\n---END-CONTEXT---"
 
     try:
@@ -24,7 +26,7 @@ def fallback_llm_tool(query: str, context: str = "", domain=None, document_id=No
             question=query,
             context=final_context,
             max_tokens=200,
-            mood="neutral"
+            mood="neutral",
         )
     except Exception:
         return "The context does not contain enough information to answer this question."
@@ -33,3 +35,4 @@ def fallback_llm_tool(query: str, context: str = "", domain=None, document_id=No
         return "The context does not contain enough information to answer this question."
 
     return answer.strip()
+

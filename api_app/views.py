@@ -82,77 +82,74 @@ class AskAPIView(APIView):
         user = request.user
         query = serializer.validated_data["query"].strip()
         mood = request.data.get("mood", "neutral")
-        # Domain stored in session; document_id can be provided by frontend
+
         domain = request.session.get("active_domain")
         document_id = request.data.get("document_id")
-        memory = load_vector_memory(user, query)
+
         route = classify_intent_and_route(query)
         intent = route.get("intent")
-        intent_conf = route.get("confidence", 1.0)
 
-        # force doc intent if explicitly passing document_id
-        if document_id:
+        # If intent is pure chat/small-talk, answer directly without RAG or web.
+        if intent == "chat":
+            try:
+                ans = call_llm_answer(question=query, context="", mood=mood, max_tokens=128) or "Hi, how can I help you today?"
+            except Exception:
+                ans = "Hi, how can I help you today?"
+            store_conversation_turn(user, query, ans)
+            QueryLog.objects.create(user=user, query=query, top_score=1.0, chunks=[])
+            return Response({
+                "answer": ans,
+                "mode": "agent",
+                "source": "chat",
+                "confidence": 1.0,
+                "chunks": [],
+                "trace": [{"step": "intent", "intent": "chat"}],
+            })
+
+        # If a document is selected and this is not pure chat,
+        # treat it as a strict document question regardless of classifier quirks.
+        if document_id and intent != "chat":
             intent = "doc"
 
-        # MEMORY STORE
-        if intent == "memory_store":
-            content = query
-            low = content.strip().lower()
-            for pref in ("remember that", "remember", "note that", "please remember", "store"):
-                if low.startswith(pref):
-                    content = content[len(pref):].strip()
-                    break
-            if not content:
-                content = query
-            stored = False
-            try:
-                stored = add_memory_fact(user=user, text=content)
-            except Exception:
-                try:
-                    store_conversation_turn(user, f"[MEMORY] {content}", "")
-                    stored = True
-                except Exception:
-                    stored = False
-
-            QueryLog.objects.create(user=user, query=query, top_score=0.0, chunks=[])
-            if stored:
-                return Response({"answer": "Okay — I will remember that.", "mode": "memory_store", "confidence": intent_conf})
-            return Response({"answer": "I tried to save that memory but ran into an issue.", "mode": "memory_store", "confidence": 0.0}, status=500)
-
-        # MEMORY RECALL via agent
-        if intent == "memory_recall":
-            agent = build_agent(user_id=user.id, domain=domain, document_id=document_id, allow_web=False, agent_enabled=True)
-            agent_raw = agent.run(query)
-            agent_res = normalize_agent_output(agent_raw)
-            final_text = safe_text(agent_res["answer"])
-            store_conversation_turn(user, query, final_text)
-            return Response({"answer": final_text, "mode": "agent_memory", "confidence": intent_conf, "chunks": agent_res.get("chunks", []), "trace": agent_res.get("trace", [])})
-
-        # CHAT-only intent -> direct LLM
-        if intent == "chat":
-            answer = call_llm_answer(question=query, context="Casual conversation.", mood=mood, max_tokens=60)
-            store_conversation_turn(user, query, answer)
-            QueryLog.objects.create(user=user, query=query, top_score=0.0, chunks=[])
-            return Response({"answer": answer, "mode": "chat", "confidence": intent_conf, "chunks": []})
-
-        # DOCUMENT question -> AGENT-driven RAG
-        if intent == "doc":
-            agent = build_agent(user_id=user.id, domain=domain, document_id=document_id, allow_web=True, agent_enabled=True)
+        # Strict document questions should NEVER broaden to web.
+        # They must answer only from the selected document or admit they don't know.
+        if intent == "doc" and document_id:
+            agent = build_agent(
+                user_id=user.id,
+                domain=domain,
+                document_id=document_id,
+                allow_web=False,  # disable web for strict doc queries
+                agent_enabled=True,
+            )
             agent_res = agent.run(query)
             final_ans = safe_text(agent_res.get("answer", ""))
+            source = agent_res.get("answer_source", "document")
             store_conversation_turn(user, query, final_ans)
             QueryLog.objects.create(user=user, query=query, top_score=agent_res.get("confidence", 0.0), chunks=agent_res.get("chunks", []))
-            return Response({"answer": final_ans, "mode": "agent", "confidence": float(agent_res.get("confidence", 0.0)), "chunks": agent_res.get("chunks", []), "trace": agent_res.get("trace", [])})
+            return Response({
+                "answer": final_ans,
+                "mode": "agent",
+                "source": source,
+                "confidence": float(agent_res.get("confidence", 0.0)),
+                "chunks": agent_res.get("chunks", []),
+                "trace": agent_res.get("trace", []),
+            })
 
-        # Default: Agent orchestrates RAG + retries
-        agent = build_agent(user_id=user.id, domain=domain, document_id=document_id, allow_web=True, agent_enabled=True)
+        # All other intents (knowledge/agent/memory) use open agent with web allowed.
+        agent = build_agent(user_id=user.id, domain=domain, document_id=None, allow_web=True, agent_enabled=True)
         agent_res = agent.run(query)
         final_ans = safe_text(agent_res.get("answer", ""))
+        source = agent_res.get("answer_source", "agent")
         store_conversation_turn(user, query, final_ans)
         QueryLog.objects.create(user=user, query=query, top_score=agent_res.get("confidence", 0.0), chunks=agent_res.get("chunks", []))
-        return Response({"answer": final_ans, "mode": "agent", "confidence": float(agent_res.get("confidence", 0.0)), "chunks": agent_res.get("chunks", []), "trace": agent_res.get("trace", [])})
-
-
+        return Response({
+            "answer": final_ans,
+            "mode": "agent",
+            "source": source,
+            "confidence": float(agent_res.get("confidence", 0.0)),
+            "chunks": agent_res.get("chunks", []),
+            "trace": agent_res.get("trace", []),
+        })
 # -------------------------------------------------------
 # FEEDBACK SYSTEM
 # -------------------------------------------------------
@@ -345,10 +342,8 @@ class ConversationChatAPIView(APIView):
         doc_id = request.data.get("document_id")
         memory = load_vector_memory(request.user, query)
 
-        # Check chat intent before agent/rag
         route = classify_intent_and_route(query)
         if route.get("intent") == "chat" and not agent_mode:
-            # lightweight chat bypass: use simple LLM for small talk
             answer = call_llm_answer(question=query, context="Casual conversation.", mood=mood, max_tokens=80)
             Message.objects.create(conversation=conv, role="user", content=query)
             Message.objects.create(conversation=conv, role="assistant", content=answer)
@@ -356,17 +351,36 @@ class ConversationChatAPIView(APIView):
             QueryLog.objects.create(user=request.user, query=query, top_score=0, chunks=[])
             return Response({"answer": answer, "mode": "chat", "confidence": float(route.get("confidence", 0.9)), "chunks": []})
 
-        # Use agent with domain/document context ALWAYS
-        agent = build_agent(user_id=request.user.id, domain=domain, document_id=doc_id, allow_web=True, agent_enabled=True)
-        agent_raw = agent.run(query)
-        agent_res = normalize_agent_output(agent_raw)
-        final_text = safe_text(agent_res["answer"])
+        # Agentic RAG path
+        agent = build_agent(
+            user_id=request.user.id,
+            domain=domain,
+            document_id=doc_id,
+            allow_web=True,
+            agent_enabled=True,
+        )
+        agent_res = agent.run(query)
+        final_ans = safe_text(agent_res.get("answer", ""))
+        source = agent_res.get("answer_source", "agent")
 
         Message.objects.create(conversation=conv, role="user", content=query)
-        Message.objects.create(conversation=conv, role="assistant", content=final_text)
-        store_conversation_turn(request.user, query, final_text)
-        QueryLog.objects.create(user=request.user, query=query, top_score=agent_res.get("confidence", 0.0), chunks=agent_res.get("chunks", []))
-        return Response(agent_res)
+        Message.objects.create(conversation=conv, role="assistant", content=final_ans)
+        store_conversation_turn(request.user, query, final_ans)
+        QueryLog.objects.create(
+            user=request.user,
+            query=query,
+            top_score=agent_res.get("confidence", 0.0),
+            chunks=agent_res.get("chunks", []),
+        )
+
+        return Response({
+            "answer": final_ans,
+            "mode": "agent",
+            "source": source,
+            "confidence": float(agent_res.get("confidence", 0.0)),
+            "chunks": agent_res.get("chunks", []),
+            "trace": agent_res.get("trace", []),
+        })
 
 
 # ========= Chat History / Rename / Delete ========= #
