@@ -96,6 +96,7 @@ class AgenticRAG:
         domain: Optional[str] = None,
         document_id: Optional[str] = None,
         agent_enabled: bool = True,
+        question_intent: Optional[str] = None,
     ):
         self.user_id = user_id
         self.user = user_obj
@@ -104,6 +105,9 @@ class AgenticRAG:
         self.domain = domain
         self.document_id = document_id
         self.agent_enabled = agent_enabled
+        # Optional hint from the router about what kind of
+        # question this is ("doc_summary", "doc_lookup", etc.).
+        self.question_intent: Optional[str] = question_intent
         self._executor = None
 
         if LANGCHAIN_AVAILABLE and agent_enabled:
@@ -301,12 +305,28 @@ Question: {input}
             trace.append({"step": "semantic_score", "attempt": attempt, "value": sem_score})
 
             # Accept document answers more eagerly in strict doc mode
-            # (document_id is set) where we expect the value to be present
-            # in this specific document. For open-agent mode (no document_id)
-            # keep the stricter rule.
+            # (document_id is set). For open-agent mode (no document_id)
+            # keep a stricter rule.
             if self.document_id is not None:
-                accept = eval_res.get("quality") in ("good", "weak") and sem_score >= 0.60
+                # For strict document questions:
+                # - doc_summary: allow answers whenever some context exists and
+                #   evaluator is at least "weak" (used for high-level summaries).
+                # - doc_lookup or unknown: keep stricter rules so we do not
+                #   hallucinate specific values.
+                qi = (self.question_intent or "").strip().lower()
+                if qi == "doc_summary":
+                    accept = eval_res.get("quality") in ("good", "weak") and bool(chunks)
+                else:
+                    # - If evaluator says "good", always allow a doc-based answer.
+                    # - If evaluator says "weak", require a strong semantic match
+                    #   to avoid hallucinating specific values.
+                    if eval_res.get("quality") == "good":
+                        accept = True
+                    else:
+                        accept = eval_res.get("quality") == "weak" and sem_score >= 0.60
             else:
+                # Open agent mode: only accept when context is clearly good
+                # and aligned with the question.
                 accept = eval_res.get("quality") == "good" and sem_score >= SEMANTIC_MIN_SCORE
 
             if accept:
@@ -352,7 +372,41 @@ Question: {input}
                                 "document_id": self.document_id,
                             }))
                         except Exception:
-                            final = context[:800] or "I don’t know based on the available documentation."
+                            final = context[:800] or "I don't know based on the available documentation."
+                        return {
+                            "answer": final,
+                            "mode": "agent_web",
+                            "source": "web",
+                            "answer_source": "web",
+                            "confidence": float(web_res.get("confidence", 0.5)),
+                            "chunks": web_res.get("chunks", []),
+                            "trace": trace,
+                            "steps": attempt,
+                        }
+                except Exception:
+                    pass
+
+            # In open-agent mode (no document_id), if chunks are weak but
+            # semantically strong for a general question, prefer web over
+            # returning "I don't know".
+            if self.document_id is None and eval_res.get("quality") == "weak" and sem_score >= SEMANTIC_MIN_SCORE and self.allow_web:
+                trace.append({"step": "weak_but_semantic_high_trigger_web", "attempt": attempt, "sem_score": sem_score})
+                try:
+                    web_res = self._call_web_fallback(refined_query, max_chunks=4)
+                    trace.append({"step": "web_search", "attempt": attempt, "result_found": web_res.get("found", False)})
+                    if web_res.get("found"):
+                        context = web_res.get("context", "") or "\n\n---\n\n".join(
+                            c.get("text", "") for c in web_res.get("chunks", [])[:4]
+                        )
+                        try:
+                            final = tool_fallback(json.dumps({
+                                "query": user_query,
+                                "context": context,
+                                "domain": self.domain,
+                                "document_id": self.document_id,
+                            }))
+                        except Exception:
+                            final = context[:800] or "I don't know based on the available documentation."
                         return {
                             "answer": final,
                             "mode": "agent_web",
@@ -435,11 +489,27 @@ Question: {input}
         }
 
 
-def build_agent(user_id=None, agent_enabled=True, allow_web: bool = True, domain: Optional[str] = None, document_id: Optional[str] = None, **kwargs):
+def build_agent(
+    user_id=None,
+    agent_enabled=True,
+    allow_web: bool = True,
+    domain: Optional[str] = None,
+    document_id: Optional[str] = None,
+    **kwargs,
+):
     user_obj = None
     if User and user_id:
         try:
             user_obj = User.objects.get(id=user_id)
         except Exception:
             user_obj = None
-    return AgenticRAG(user_id=user_id, user_obj=user_obj, allow_web=allow_web, max_retries=kwargs.get("max_retries", 3), domain=domain, document_id=document_id, agent_enabled=agent_enabled)
+    return AgenticRAG(
+        user_id=user_id,
+        user_obj=user_obj,
+        allow_web=allow_web,
+        max_retries=kwargs.get("max_retries", 3),
+        domain=domain,
+        document_id=document_id,
+        agent_enabled=agent_enabled,
+        question_intent=kwargs.get("question_intent"),
+    )

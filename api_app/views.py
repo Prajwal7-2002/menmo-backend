@@ -106,20 +106,16 @@ class AskAPIView(APIView):
                 "trace": [{"step": "intent", "intent": "chat"}],
             })
 
-        # If a document is selected and this is not pure chat,
-        # treat it as a strict document question regardless of classifier quirks.
-        if document_id and intent != "chat":
-            intent = "doc"
-
-        # Strict document questions should NEVER broaden to web.
-        # They must answer only from the selected document or admit they don't know.
-        if intent == "doc" and document_id:
+        # Strict document questions (doc_summary/doc_lookup) answer ONLY from the selected document
+        # and never broaden to web. Non-doc intents (knowledge/agent/memory) can use web.
+        if intent in ("doc", "doc_summary", "doc_lookup") and document_id:
             agent = build_agent(
                 user_id=user.id,
                 domain=domain,
                 document_id=document_id,
-                allow_web=False,  # disable web for strict doc queries
+                allow_web=False,
                 agent_enabled=True,
+                question_intent=intent,
             )
             agent_res = agent.run(query)
             final_ans = safe_text(agent_res.get("answer", ""))
