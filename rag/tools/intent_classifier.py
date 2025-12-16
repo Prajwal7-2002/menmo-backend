@@ -79,7 +79,7 @@ def classify_intent_and_route(query: str) -> Dict[str, Any]:
     if not query or not query.strip():
         return {"intent": "chat", "confidence": 0.95, "note": "empty or whitespace"}
 
-    # Quick heuristic overrides for clear memory store phrases (fast path)
+    # Quick heuristic overrides for clear memory/memory-like phrases (fast path)
     qlow = query.strip().lower()
     if qlow.startswith(("remember ", "remember that ", "note that ", "store ", "please remember ")):
         return {
@@ -104,6 +104,27 @@ def classify_intent_and_route(query: str) -> Dict[str, Any]:
             "confidence": 0.9,
             "note": "heuristic: recall question",
         }
+
+    # Heuristic: generic definition questions ("what is X", "who is X")
+    # that do NOT explicitly tie themselves to "this document/report"
+    # should be treated as general knowledge, not doc_summary/doc_lookup.
+    if qlow.startswith(("what is ", "who is ")):
+        if not any(
+            kw in qlow
+            for kw in (
+                "this document",
+                "this report",
+                "in this document",
+                "in this report",
+                "according to this document",
+                "according to this report",
+            )
+        ):
+            return {
+                "intent": "knowledge",
+                "confidence": 0.9,
+                "note": "heuristic: generic definition, not tied to document",
+            }
 
     try:
         raw = call_llm_answer(
@@ -166,4 +187,3 @@ def classify_intent_and_route(query: str) -> Dict[str, Any]:
 
     # Last resort: safe fallback
     return FALLBACK_DEFAULT
-

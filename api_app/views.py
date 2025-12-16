@@ -96,7 +96,13 @@ class AskAPIView(APIView):
             except Exception:
                 ans = "Hi, how can I help you today?"
             store_conversation_turn(user, query, ans)
-            QueryLog.objects.create(user=user, query=query, top_score=1.0, chunks=[])
+            qlog = QueryLog.objects.create(
+                user=user,
+                query=query,
+                answer=ans,
+                top_score=1.0,
+                chunks=[],
+            )
             return Response({
                 "answer": ans,
                 "mode": "agent",
@@ -104,6 +110,8 @@ class AskAPIView(APIView):
                 "confidence": 1.0,
                 "chunks": [],
                 "trace": [{"step": "intent", "intent": "chat"}],
+                "query_id": str(qlog.id),
+                "query_log_id": str(qlog.id),
             })
 
         # Strict document questions (doc_summary/doc_lookup) answer ONLY from the selected document
@@ -121,7 +129,13 @@ class AskAPIView(APIView):
             final_ans = safe_text(agent_res.get("answer", ""))
             source = agent_res.get("answer_source", "document")
             store_conversation_turn(user, query, final_ans)
-            QueryLog.objects.create(user=user, query=query, top_score=agent_res.get("confidence", 0.0), chunks=agent_res.get("chunks", []))
+            qlog = QueryLog.objects.create(
+                user=user,
+                query=query,
+                answer=final_ans,
+                top_score=agent_res.get("confidence", 0.0),
+                chunks=agent_res.get("chunks", []),
+            )
             return Response({
                 "answer": final_ans,
                 "mode": "agent",
@@ -129,6 +143,8 @@ class AskAPIView(APIView):
                 "confidence": float(agent_res.get("confidence", 0.0)),
                 "chunks": agent_res.get("chunks", []),
                 "trace": agent_res.get("trace", []),
+                "query_id": str(qlog.id),
+                "query_log_id": str(qlog.id),
             })
 
         # All other intents (knowledge/agent/memory) use open agent with web allowed.
@@ -137,7 +153,13 @@ class AskAPIView(APIView):
         final_ans = safe_text(agent_res.get("answer", ""))
         source = agent_res.get("answer_source", "agent")
         store_conversation_turn(user, query, final_ans)
-        QueryLog.objects.create(user=user, query=query, top_score=agent_res.get("confidence", 0.0), chunks=agent_res.get("chunks", []))
+        qlog = QueryLog.objects.create(
+            user=user,
+            query=query,
+            answer=final_ans,
+            top_score=agent_res.get("confidence", 0.0),
+            chunks=agent_res.get("chunks", []),
+        )
         return Response({
             "answer": final_ans,
             "mode": "agent",
@@ -145,6 +167,8 @@ class AskAPIView(APIView):
             "confidence": float(agent_res.get("confidence", 0.0)),
             "chunks": agent_res.get("chunks", []),
             "trace": agent_res.get("trace", []),
+            "query_id": str(qlog.id),
+            "query_log_id": str(qlog.id),
         })
 # -------------------------------------------------------
 # FEEDBACK SYSTEM
@@ -339,22 +363,50 @@ class ConversationChatAPIView(APIView):
         memory = load_vector_memory(request.user, query)
 
         route = classify_intent_and_route(query)
-        if route.get("intent") == "chat" and not agent_mode:
+        intent = route.get("intent")
+
+        if intent == "chat" and not agent_mode:
             answer = call_llm_answer(question=query, context="Casual conversation.", mood=mood, max_tokens=80)
             Message.objects.create(conversation=conv, role="user", content=query)
             Message.objects.create(conversation=conv, role="assistant", content=answer)
             store_conversation_turn(request.user, query, answer)
-            QueryLog.objects.create(user=request.user, query=query, top_score=0, chunks=[])
-            return Response({"answer": answer, "mode": "chat", "confidence": float(route.get("confidence", 0.9)), "chunks": []})
+            qlog = QueryLog.objects.create(
+                user=request.user,
+                query=query,
+                answer=answer,
+                top_score=0,
+                chunks=[],
+            )
+            return Response({
+                "answer": answer,
+                "mode": "chat",
+                "confidence": float(route.get("confidence", 0.9)),
+                "chunks": [],
+                "query_id": str(qlog.id),
+                "query_log_id": str(qlog.id),
+            })
 
         # Agentic RAG path
-        agent = build_agent(
-            user_id=request.user.id,
-            domain=domain,
-            document_id=doc_id,
-            allow_web=True,
-            agent_enabled=True,
-        )
+        # Mirror AskAPIView routing: doc_* intents with document_id use strict
+        # document mode; all others use open agent with web allowed.
+        if intent in ("doc", "doc_summary", "doc_lookup") and doc_id:
+            agent = build_agent(
+                user_id=request.user.id,
+                domain=domain,
+                document_id=doc_id,
+                allow_web=False,
+                agent_enabled=True,
+                question_intent=intent,
+            )
+        else:
+            agent = build_agent(
+                user_id=request.user.id,
+                domain=domain,
+                document_id=None,
+                allow_web=True,
+                agent_enabled=True,
+                question_intent=intent,
+            )
         agent_res = agent.run(query)
         final_ans = safe_text(agent_res.get("answer", ""))
         source = agent_res.get("answer_source", "agent")
@@ -362,9 +414,10 @@ class ConversationChatAPIView(APIView):
         Message.objects.create(conversation=conv, role="user", content=query)
         Message.objects.create(conversation=conv, role="assistant", content=final_ans)
         store_conversation_turn(request.user, query, final_ans)
-        QueryLog.objects.create(
+        qlog = QueryLog.objects.create(
             user=request.user,
             query=query,
+            answer=final_ans,
             top_score=agent_res.get("confidence", 0.0),
             chunks=agent_res.get("chunks", []),
         )
@@ -376,6 +429,8 @@ class ConversationChatAPIView(APIView):
             "confidence": float(agent_res.get("confidence", 0.0)),
             "chunks": agent_res.get("chunks", []),
             "trace": agent_res.get("trace", []),
+            "query_id": str(qlog.id),
+            "query_log_id": str(qlog.id),
         })
 
 
