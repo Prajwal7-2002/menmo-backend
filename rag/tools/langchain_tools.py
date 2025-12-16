@@ -33,6 +33,12 @@ class WrappedLLM(BaseChatModel):
     def _llm_type(self):
         return "chat-groq"
 
+    # LangChain 0.2 expects LLMs to implement the Runnable interface
+    # with a .bind(**kwargs) method. For our purposes we can safely
+    # ignore bound kwargs (e.g. stop tokens) and return self.
+    def bind(self, **kwargs):
+        return self
+
     def _convert_messages(self, messages):
         result = []
         for m in messages:

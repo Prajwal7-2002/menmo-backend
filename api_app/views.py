@@ -39,7 +39,6 @@ from rag.memory import (
 )
 
 from api_app.models import Conversation, Message
-from rag.tools.intent_classifier import classify_intent_and_route
 from rag.llm import call_llm_answer
 
 # ------------------------
@@ -83,72 +82,20 @@ class AskAPIView(APIView):
         query = serializer.validated_data["query"].strip()
         mood = request.data.get("mood", "neutral")
 
-        domain = request.session.get("active_domain")
+        # Prefer explicit domain from the request body; fall back to session.
+        # This keeps behaviour consistent between Postman and the React frontend.
+        domain = request.data.get("domain") or request.session.get("active_domain")
         document_id = request.data.get("document_id")
 
-        route = classify_intent_and_route(query)
-        intent = route.get("intent")
-
-        # If intent is pure chat/small-talk, answer directly without RAG or web.
-        if intent == "chat":
-            try:
-                ans = call_llm_answer(question=query, context="", mood=mood, max_tokens=128) or "Hi, how can I help you today?"
-            except Exception:
-                ans = "Hi, how can I help you today?"
-            store_conversation_turn(user, query, ans)
-            qlog = QueryLog.objects.create(
-                user=user,
-                query=query,
-                answer=ans,
-                top_score=1.0,
-                chunks=[],
-            )
-            return Response({
-                "answer": ans,
-                "mode": "agent",
-                "source": "chat",
-                "confidence": 1.0,
-                "chunks": [],
-                "trace": [{"step": "intent", "intent": "chat"}],
-                "query_id": str(qlog.id),
-                "query_log_id": str(qlog.id),
-            })
-
-        # Strict document questions (doc_summary/doc_lookup) answer ONLY from the selected document
-        # and never broaden to web. Non-doc intents (knowledge/agent/memory) can use web.
-        if intent in ("doc", "doc_summary", "doc_lookup") and document_id:
-            agent = build_agent(
-                user_id=user.id,
-                domain=domain,
-                document_id=document_id,
-                allow_web=False,
-                agent_enabled=True,
-                question_intent=intent,
-            )
-            agent_res = agent.run(query)
-            final_ans = safe_text(agent_res.get("answer", ""))
-            source = agent_res.get("answer_source", "document")
-            store_conversation_turn(user, query, final_ans)
-            qlog = QueryLog.objects.create(
-                user=user,
-                query=query,
-                answer=final_ans,
-                top_score=agent_res.get("confidence", 0.0),
-                chunks=agent_res.get("chunks", []),
-            )
-            return Response({
-                "answer": final_ans,
-                "mode": "agent",
-                "source": source,
-                "confidence": float(agent_res.get("confidence", 0.0)),
-                "chunks": agent_res.get("chunks", []),
-                "trace": agent_res.get("trace", []),
-                "query_id": str(qlog.id),
-                "query_log_id": str(qlog.id),
-            })
-
-        # All other intents (knowledge/agent/memory) use open agent with web allowed.
-        agent = build_agent(user_id=user.id, domain=domain, document_id=None, allow_web=True, agent_enabled=True)
+        # Single agentic path: build one agent with current domain/document_id
+        # and let it orchestrate tools (RAG, web, memory, fallback).
+        agent = build_agent(
+            user_id=user.id,
+            domain=domain,
+            document_id=document_id or None,
+            allow_web=True,
+            agent_enabled=True,
+        )
         agent_res = agent.run(query)
         final_ans = safe_text(agent_res.get("answer", ""))
         source = agent_res.get("answer_source", "agent")
@@ -356,58 +303,37 @@ class ConversationChatAPIView(APIView):
         if not query:
             return Response({"detail": "empty prompt"}, status=400)
 
-        agent_mode = bool(request.data.get("agent_mode"))
-        domain = request.session.get("active_domain")
+        # Prefer explicit domain from the request body; fall back to session.
+        # This ensures the selected domain in the UI scopes retrieval correctly.
+        domain = request.data.get("domain") or request.session.get("active_domain")
         mood = request.data.get("mood", "neutral")
         doc_id = request.data.get("document_id")
-        memory = load_vector_memory(request.user, query)
-
-        route = classify_intent_and_route(query)
-        intent = route.get("intent")
-
-        if intent == "chat" and not agent_mode:
-            answer = call_llm_answer(question=query, context="Casual conversation.", mood=mood, max_tokens=80)
-            Message.objects.create(conversation=conv, role="user", content=query)
-            Message.objects.create(conversation=conv, role="assistant", content=answer)
-            store_conversation_turn(request.user, query, answer)
-            qlog = QueryLog.objects.create(
-                user=request.user,
-                query=query,
-                answer=answer,
-                top_score=0,
-                chunks=[],
-            )
-            return Response({
-                "answer": answer,
-                "mode": "chat",
-                "confidence": float(route.get("confidence", 0.9)),
-                "chunks": [],
-                "query_id": str(qlog.id),
-                "query_log_id": str(qlog.id),
-            })
-
-        # Agentic RAG path
-        # Mirror AskAPIView routing: doc_* intents with document_id use strict
-        # document mode; all others use open agent with web allowed.
-        if intent in ("doc", "doc_summary", "doc_lookup") and doc_id:
-            agent = build_agent(
-                user_id=request.user.id,
-                domain=domain,
-                document_id=doc_id,
-                allow_web=False,
-                agent_enabled=True,
-                question_intent=intent,
-            )
-        else:
-            agent = build_agent(
-                user_id=request.user.id,
-                domain=domain,
-                document_id=None,
-                allow_web=True,
-                agent_enabled=True,
-                question_intent=intent,
-            )
+        # Debug: log what scope this chat is using
+        print(
+            "[CHAT] user=", request.user.id,
+            "query=", query[:80],
+            "domain=", domain,
+            "document_id=", doc_id,
+        )
+        # Single agentic path: build one agent with current domain/document_id
+        # and let it orchestrate tools (RAG, web, memory, fallback).
+        agent = build_agent(
+            user_id=request.user.id,
+            domain=domain,
+            document_id=doc_id or None,
+            allow_web=True,
+            agent_enabled=True,
+        )
         agent_res = agent.run(query)
+        chunks = agent_res.get("chunks", []) or []
+        if chunks:
+            first = chunks[0]
+            meta = first.get("meta") or {}
+            print(
+                "[CHAT RESULT] first_chunk_doc=", meta.get("document_id"),
+                "domain=", meta.get("domain"),
+            )
+
         final_ans = safe_text(agent_res.get("answer", ""))
         source = agent_res.get("answer_source", "agent")
 
@@ -419,7 +345,7 @@ class ConversationChatAPIView(APIView):
             query=query,
             answer=final_ans,
             top_score=agent_res.get("confidence", 0.0),
-            chunks=agent_res.get("chunks", []),
+            chunks=chunks,
         )
 
         return Response({
@@ -427,7 +353,7 @@ class ConversationChatAPIView(APIView):
             "mode": "agent",
             "source": source,
             "confidence": float(agent_res.get("confidence", 0.0)),
-            "chunks": agent_res.get("chunks", []),
+            "chunks": chunks,
             "trace": agent_res.get("trace", []),
             "query_id": str(qlog.id),
             "query_log_id": str(qlog.id),

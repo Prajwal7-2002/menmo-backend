@@ -7,11 +7,16 @@ logger = logging.getLogger(__name__)
 
 # Try to import langchain agent utilities; degrade gracefully.
 try:
-    from langchain.agents.react.base import create_react_agent
-    from langchain.agents import AgentExecutor
+    # Modern LangChain exposes create_react_agent from langchain.agents
+    from langchain.agents import create_react_agent, AgentExecutor
     LANGCHAIN_AVAILABLE = True
 except Exception:
     LANGCHAIN_AVAILABLE = False
+
+# Optional flag to turn on the LangChain ReAct agent.
+# By default we KEEP THIS OFF and use the manual AgenticRAG.run() pipeline,
+# because the LangChain path is more brittle across versions.
+USE_REACT_AGENT = str(__import__("os").environ.get("USE_REACT_AGENT", "0")).lower() in ("1", "true", "yes")
 
 # Local tool wrappers (from rag.tools.langchain_tools)
 try:
@@ -110,7 +115,9 @@ class AgenticRAG:
         self.question_intent: Optional[str] = question_intent
         self._executor = None
 
-        if LANGCHAIN_AVAILABLE and agent_enabled:
+        # Only build the LangChain ReAct agent when explicitly enabled.
+        # Otherwise, rely on the manual tool-orchestrated pipeline in run().
+        if LANGCHAIN_AVAILABLE and agent_enabled and USE_REACT_AGENT:
             try:
                 self._build_agent()
             except Exception as e:
@@ -291,6 +298,44 @@ Question: {input}
 
             trace.append({"step": "rag", "attempt": attempt, "chunks_count": len(chunks)})
 
+            # If there is no internal context at all and we are NOT in strict
+            # document mode, prefer to go directly to web (when allowed)
+            # instead of returning an empty/fallback answer.
+            if not chunks and self.allow_web and self.document_id is None:
+                try:
+                    web_res = self._call_web_fallback(refined_query, max_chunks=4)
+                    trace.append({
+                        "step": "no_rag_chunks_trigger_web",
+                        "attempt": attempt,
+                        "result_found": web_res.get("found", False),
+                    })
+                    if web_res.get("found"):
+                        context = web_res.get("context", "") or "\n\n---\n\n".join(
+                            c.get("text", "") for c in web_res.get("chunks", [])[:4]
+                        )
+                        try:
+                            final = tool_fallback(json.dumps({
+                                "query": user_query,
+                                "context": context,
+                                "domain": self.domain,
+                                "document_id": self.document_id,
+                            }))
+                        except Exception:
+                            final = context[:800] or "I don't know based on the available documentation."
+                        return {
+                            "answer": final,
+                            "mode": "agent_web",
+                            "source": "web",
+                            "answer_source": "web",
+                            "confidence": float(web_res.get("confidence", 0.5)),
+                            "chunks": web_res.get("chunks", []),
+                            "trace": trace,
+                            "steps": attempt,
+                        }
+                except Exception:
+                    # If web also fails, fall through to the normal evaluator logic
+                    pass
+
             # evaluate chunks
             try:
                 eval_input = json.dumps({"chunks": chunks})
@@ -438,7 +483,8 @@ Question: {input}
             # last attempt -> web fallback
             if self.allow_web and attempt == self.max_retries:
                 try:
-                    web_res = self._call_rag_search_direct(refined_query, max_chunks=4)
+                    # Final safety net: try web search one more time.
+                    web_res = self._call_web_fallback(refined_query, max_chunks=4)
                     trace.append({"step": "web_search_last_attempt", "attempt": attempt, "found": web_res.get("found", False)})
                     if web_res.get("found"):
                         context = web_res.get("context", "") or "\n\n---\n\n".join(c.get("text", "") for c in web_res.get("chunks", [])[:4])
