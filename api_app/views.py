@@ -40,6 +40,7 @@ from rag.memory import (
 
 from api_app.models import Conversation, Message
 from rag.llm import call_llm_answer
+from rag.tools.intent_classifier import classify_intent_and_route
 
 # ------------------------
 # Small helpers
@@ -83,19 +84,70 @@ class AskAPIView(APIView):
         mood = request.data.get("mood", "neutral")
 
         # Prefer explicit domain from the request body; fall back to session.
-        # This keeps behaviour consistent between Postman and the React frontend.
         domain = request.data.get("domain") or request.session.get("active_domain")
         document_id = request.data.get("document_id")
 
-        # Single agentic path: build one agent with current domain/document_id
-        # and let it orchestrate tools (RAG, web, memory, fallback).
-        agent = build_agent(
-            user_id=user.id,
-            domain=domain,
-            document_id=document_id or None,
-            allow_web=True,
-            agent_enabled=True,
-        )
+        # Let the intent router decide whether this is doc-focused, chat, or
+        # open knowledge. This keeps behaviour agentic without hard-coded
+        # keyword rules in the view.
+        route = classify_intent_and_route(query)
+        intent = (route.get("intent") or "").lower()
+
+        # Pure chat: small‑talk, greetings – bypass RAG/web.
+        if intent == "chat":
+            try:
+                ans = call_llm_answer(
+                    question=query,
+                    context="Casual conversation.",
+                    mood=mood,
+                    max_tokens=128,
+                ) or "Hi, how can I help you today?"
+            except Exception:
+                ans = "Hi, how can I help you today?"
+            store_conversation_turn(user, query, ans)
+            qlog = QueryLog.objects.create(
+                user=user,
+                query=query,
+                answer=ans,
+                top_score=1.0,
+                chunks=[],
+            )
+            return Response({
+                "answer": ans,
+                "mode": "agent",
+                "source": "chat",
+                "confidence": 1.0,
+                "chunks": [],
+                "trace": [{"step": "intent", "intent": "chat"}],
+                "query_id": str(qlog.id),
+                "query_log_id": str(qlog.id),
+            })
+
+        # Doc‑focused intents: stay strictly within the selected document,
+        # but still allow the agent to go to web if the doc truly cannot help.
+        if intent in ("doc", "doc_summary", "doc_lookup") and document_id:
+            agent = build_agent(
+                user_id=user.id,
+                domain=domain,
+                document_id=document_id or None,
+                allow_web=True,
+                agent_enabled=True,
+                question_intent=intent,
+            )
+        else:
+            # Knowledge / mixed intents: run in open‑agent mode (no hard
+            # document constraint). The agent can still use RAG if helpful,
+            # but is free to use web/general knowledge instead of forcing
+            # a weak document answer.
+            agent = build_agent(
+                user_id=user.id,
+                domain=domain,
+                document_id=None,
+                allow_web=True,
+                agent_enabled=True,
+                question_intent=intent,
+            )
+
         agent_res = agent.run(query)
         final_ans = safe_text(agent_res.get("answer", ""))
         source = agent_res.get("answer_source", "agent")
@@ -308,22 +360,75 @@ class ConversationChatAPIView(APIView):
         domain = request.data.get("domain") or request.session.get("active_domain")
         mood = request.data.get("mood", "neutral")
         doc_id = request.data.get("document_id")
+
+        # Route by intent so that chat/doc/knowledge behave differently
+        # without hard‑coding keyword rules here.
+        route = classify_intent_and_route(query)
+        intent = (route.get("intent") or "").lower()
+
         # Debug: log what scope this chat is using
         print(
             "[CHAT] user=", request.user.id,
             "query=", query[:80],
+            "intent=", intent,
             "domain=", domain,
             "document_id=", doc_id,
         )
-        # Single agentic path: build one agent with current domain/document_id
-        # and let it orchestrate tools (RAG, web, memory, fallback).
-        agent = build_agent(
-            user_id=request.user.id,
-            domain=domain,
-            document_id=doc_id or None,
-            allow_web=True,
-            agent_enabled=True,
-        )
+
+        # Pure chat
+        if intent == "chat" and not agent_mode:
+            try:
+                answer = call_llm_answer(
+                    question=query,
+                    context="Casual conversation.",
+                    mood=mood,
+                    max_tokens=80,
+                ) or "Hi, how can I help you today?"
+            except Exception:
+                answer = "Hi, how can I help you today?"
+            Message.objects.create(conversation=conv, role="user", content=query)
+            Message.objects.create(conversation=conv, role="assistant", content=answer)
+            store_conversation_turn(request.user, query, answer)
+            qlog = QueryLog.objects.create(
+                user=request.user,
+                query=query,
+                answer=answer,
+                top_score=1.0,
+                chunks=[],
+            )
+            return Response({
+                "answer": answer,
+                "mode": "chat",
+                "source": "chat",
+                "confidence": float(route.get("confidence", 0.9)),
+                "chunks": [],
+                "trace": [{"step": "intent", "intent": "chat"}],
+                "query_id": str(qlog.id),
+                "query_log_id": str(qlog.id),
+            })
+
+        # Build appropriate agent:
+        # - doc/doc_summary/doc_lookup -> respect selected document
+        # - everything else (knowledge/agent/memory) -> open agent (no doc_id)
+        if intent in ("doc", "doc_summary", "doc_lookup") and doc_id:
+            agent = build_agent(
+                user_id=request.user.id,
+                domain=domain,
+                document_id=doc_id or None,
+                allow_web=True,
+                agent_enabled=True,
+                question_intent=intent,
+            )
+        else:
+            agent = build_agent(
+                user_id=request.user.id,
+                domain=domain,
+                document_id=None,
+                allow_web=True,
+                agent_enabled=True,
+                question_intent=intent,
+            )
+
         agent_res = agent.run(query)
         chunks = agent_res.get("chunks", []) or []
         if chunks:
