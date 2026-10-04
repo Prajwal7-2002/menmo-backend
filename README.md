@@ -1,5 +1,5 @@
 ---
-title: "Mnemo Backend"
+title: "Menmo Backend"
 emoji: "⚙️"
 colorFrom: "indigo"
 colorTo: "blue"
@@ -7,9 +7,9 @@ sdk: "docker"
 pinned: false
 ---
 
-# Mnemo Backend
+# Menmo Backend
 
-Django REST backend for Mnemo: upload documents, then chat with them. Answers come from your
+Django REST backend for Menmo: upload documents, then chat with them. Answers come from your
 documents when they're relevant, otherwise from a web search, otherwise from the LLM's general
 knowledge — and every response says which (`source`).
 

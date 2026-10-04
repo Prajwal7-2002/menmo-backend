@@ -20,7 +20,7 @@ from rag.llm import TONES, safe_completion
 INTENTS = {"chat", "doc_summary", "doc_lookup", "knowledge", "agent", "memory_store", "memory_recall"}
 VERBOSITY = {"brief", "normal", "detailed"}
 
-ROUTER_PROMPT = """You route messages for Mnemo, an assistant that answers questions about the user's uploaded documents and general topics.
+ROUTER_PROMPT = """You route messages for Menmo, an assistant that answers questions about the user's uploaded documents and general topics.
 
 Read the conversation and the latest message, then return STRICT JSON:
 {
@@ -50,7 +50,7 @@ Return only the JSON."""
 GREETING_RE = re.compile(
     r"^(hi+|hello+|hey+|yo|hiya|thanks?|thank you|thx|ty|ok(ay)?|cool|great|nice|bye|goodbye|"
     r"good (morning|afternoon|evening|night)|how are you( doing)?|what'?s up|sup)"
-    r"( there| so much| a lot| mnemo)?[\s!.?,:)]*$",
+    r"( there| so much| a lot| menmo)?[\s!.?,:)]*$",
     re.I,
 )
 REMEMBER_RE = re.compile(r"^(please\s+)?(remember|note|keep in mind|don'?t forget)\b(\s+that)?[:,]?\s*", re.I)
