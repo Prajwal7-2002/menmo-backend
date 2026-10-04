@@ -27,6 +27,8 @@ logger = logging.getLogger(__name__)
 
 MAX_UPLOAD_MB = int(os.getenv("MAX_UPLOAD_MB", "20"))
 HISTORY_MESSAGES = int(os.getenv("CHAT_HISTORY_MESSAGES", "6"))
+# Saved with each answer so reopened chats still show source, tone, citations and feedback
+ANSWER_META_FIELDS = ("source", "intent", "tone", "verbosity", "confidence", "chunks", "trace", "query_id")
 
 
 # ---------------------------------------------------------------------------
@@ -318,7 +320,8 @@ class ConversationChatAPIView(APIView):
         )
 
         Message.objects.create(conversation=conv, role="user", content=query)
-        Message.objects.create(conversation=conv, role="assistant", content=result["answer"])
+        Message.objects.create(conversation=conv, role="assistant", content=result["answer"],
+                               meta={k: result.get(k) for k in ANSWER_META_FIELDS})
         if conv.title == "New Chat":
             conv.title = query[:60] + ("…" if len(query) > 60 else "")
         conv.save()  # bumps updated_at so the chat list stays in recency order
@@ -332,7 +335,24 @@ class ConversationHistoryAPIView(APIView):
         conv = Conversation.objects.filter(id=cid, user=request.user).first()
         if conv is None:
             return Response({"detail": "not found"}, status=404)
-        return Response([{"role": m.role, "content": m.content} for m in conv.messages.order_by("timestamp", "-role")])
+        messages = list(conv.messages.order_by("timestamp", "-role"))
+
+        # Attach the user's latest rating to each answer so the UI shows it
+        query_ids = [m.meta["query_id"] for m in messages if m.meta and m.meta.get("query_id")]
+        ratings = {
+            str(qid): value
+            for qid, value in Feedback.objects.filter(query_log_id__in=query_ids, user=request.user)
+            .order_by("created_at")
+            .values_list("query_log_id", "value")
+        }
+
+        out = []
+        for m in messages:
+            item: Dict[str, Any] = {"role": m.role, "content": m.content}
+            if m.role == "assistant" and m.meta:
+                item["meta"] = {**m.meta, "feedback": ratings.get(str(m.meta.get("query_id")))}
+            out.append(item)
+        return Response(out)
 
 
 class RenameConversationAPIView(APIView):

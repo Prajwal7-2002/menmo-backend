@@ -65,3 +65,5 @@ class Message(models.Model):
     role          = models.CharField(max_length=20, choices=[("user","user"),("assistant","assistant")])
     content       = models.TextField()
     timestamp     = models.DateTimeField(auto_now_add=True)
+    # Assistant answers only: where the answer came from, tone, sources, query id
+    meta          = models.JSONField(null=True, blank=True)

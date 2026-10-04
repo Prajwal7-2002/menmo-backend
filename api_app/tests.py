@@ -110,6 +110,27 @@ class ConversationChatTests(BaseAPITest):
         res = self.client.post(self.url, {"query": "explain my options", "mood": "formal"}, format="json")
         self.assertEqual(res.data["tone"], "formal")
 
+    def test_history_keeps_answer_details_and_rating(self):
+        res = self.client.post(self.url, {"query": "what is GraphRAG"}, format="json")
+        qid = res.data["query_id"]
+        self.client.post("/api/feedback/", {"query_id": qid, "value": "down"}, format="json")
+        self.client.post("/api/feedback/", {"query_id": qid, "value": "up"}, format="json")  # changed mind
+
+        hist = self.client.get(f"/api/conversations/{self.conv.id}/history/").data
+        self.assertEqual([m["role"] for m in hist], ["user", "assistant"])
+        self.assertNotIn("meta", hist[0])
+        meta = hist[1]["meta"]
+        self.assertEqual(meta["source"], "document")
+        self.assertEqual(meta["query_id"], qid)
+        self.assertEqual(meta["chunks"][0]["id"], "chunk-1")
+        self.assertEqual(meta["tone"], "friendly")
+        self.assertEqual(meta["feedback"], "up")  # latest rating wins
+
+    def test_chat_reply_details_saved(self):
+        self.client.post(self.url, {"query": "hi"}, format="json")
+        meta = self.client.get(f"/api/conversations/{self.conv.id}/history/").data[1]["meta"]
+        self.assertEqual((meta["source"], meta["feedback"]), ("chat", None))
+
     def test_other_users_conversation(self):
         conv = Conversation.objects.create(user=self.other)
         res = self.client.post(f"/api/conversations/{conv.id}/chat/", {"query": "hi"}, format="json")
