@@ -34,10 +34,14 @@ def get_index(name: str):
         if name not in _indexes:
             if not PINECONE_API_KEY:
                 raise VectorStoreError("PINECONE_API_KEY not set")
-            if _client is None:
-                from pinecone import Pinecone
-                _client = Pinecone(api_key=PINECONE_API_KEY)
-            _indexes[name] = _client.Index(name)
+            try:
+                if _client is None:
+                    from pinecone import Pinecone
+                    _client = Pinecone(api_key=PINECONE_API_KEY)
+                # Connecting looks the index up, so a missing index fails here.
+                _indexes[name] = _client.Index(name)
+            except Exception as e:
+                raise VectorStoreError(f"cannot open Pinecone index {name!r}: {e}") from e
     return _indexes[name]
 
 

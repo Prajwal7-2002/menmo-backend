@@ -64,7 +64,8 @@ Optional:
 
 | Variable | Default | Purpose |
 |---|---|---|
-| `GROQ_MODEL` | `meta-llama/llama-4-maverick-17b-128e-instruct` | Groq model id |
+| `GROQ_MODEL` | `openai/gpt-oss-120b` | Groq model id |
+| `GROQ_FALLBACK_MODELS` | `qwen/qwen3.8-27b` | Comma-separated models tried if the main one is retired |
 | `PINECONE_INDEX_NAME` / `PINECONE_MEMORY_INDEX` | `neurostack-rag` / `neurostack-memory` | Index names (384-dim; kept from the project's earlier name so existing data stays reachable) |
 | `CORS_ALLOWED_ORIGINS` | *(all)* | Comma-separated frontend origins |
 | `DJANGO_ALLOWED_HOSTS` | Space host, `.hf.space`, localhost | Comma-separated |

@@ -193,6 +193,46 @@ class RouterTests(SimpleTestCase):
             self.assertEqual((r["intent"], r["note"]), (expected, "rules"), q)
 
 
+class ModelFallbackTests(SimpleTestCase):
+    def test_retired_model_falls_back_and_is_skipped_afterwards(self):
+        from rag import llm
+
+        class Resp:
+            def __init__(self, status, body):
+                self.status_code, self.text, self._body, self.headers = status, json.dumps(body), body, {}
+
+            def json(self):
+                return self._body
+
+        gone = Resp(404, {"error": {"code": "model_not_found"}})
+        ok = Resp(200, {"choices": [{"message": {"content": "hi"}}]})
+        session = mock.Mock()
+        session.post.side_effect = [gone, ok, ok]
+        with mock.patch.object(llm, "_session", return_value=session),              mock.patch.object(llm, "GROQ_API_KEY", "x"),              mock.patch.object(llm, "GROQ_MODEL", "old/model"),              mock.patch.object(llm, "GROQ_FALLBACK_MODELS", ["new/model"]),              mock.patch.object(llm, "_retired_models", set()):
+            self.assertEqual(llm.chat_completion([{"role": "user", "content": "x"}]), "hi")
+            self.assertEqual(llm.chat_completion([{"role": "user", "content": "x"}]), "hi")
+        models = [c.kwargs["json"]["model"] for c in session.post.call_args_list]
+        self.assertEqual(models, ["old/model", "new/model", "new/model"])  # retired model not retried
+
+    def test_reasoning_model_gets_room_to_think_and_citations_normalised(self):
+        from rag import llm
+        resp = mock.Mock(status_code=200, headers={})
+        resp.json.return_value = {"choices": [{"message": {"content": "HbA1c is 5.4%【1】 and normal【2†source】."}}]}
+        session = mock.Mock()
+        session.post.return_value = resp
+        with mock.patch.object(llm, "_session", return_value=session), mock.patch.object(llm, "GROQ_API_KEY", "x"):
+            out = llm._complete_with("openai/gpt-oss-120b", [{"role": "user", "content": "x"}], 12, 0.0)
+            self.assertEqual(session.post.call_args.kwargs["json"]["max_tokens"], llm.REASONING_MIN_TOKENS)
+            llm._complete_with("qwen/qwen3.8-27b", [{"role": "user", "content": "x"}], 12, 0.0)
+            self.assertEqual(session.post.call_args.kwargs["json"]["max_tokens"], 12)
+        self.assertEqual(out, "HbA1c is 5.4%[1] and normal[2].")
+
+    def test_reasoning_params_only_for_gpt_oss(self):
+        from rag.llm import _model_params
+        self.assertEqual(_model_params("openai/gpt-oss-120b")["include_reasoning"], False)
+        self.assertEqual(_model_params("qwen/qwen3.8-27b"), {})
+
+
 class ToneTests(SimpleTestCase):
     def test_explicit_mood_wins_auto_otherwise(self):
         from rag.llm import resolve_tone
@@ -304,6 +344,14 @@ class LoaderTests(TestCase):
 
 
 class VectorstoreTests(SimpleTestCase):
+    def test_missing_index_raises_vectorstore_error(self):
+        client = mock.Mock()
+        client.Index.side_effect = RuntimeError("(404) Resource neurostack-rag-dev not found")
+        with mock.patch.object(vectorstore, "PINECONE_API_KEY", "x"),              mock.patch.object(vectorstore, "_client", client),              mock.patch.object(vectorstore, "_indexes", {}):
+            with self.assertRaises(vectorstore.VectorStoreError):
+                vectorstore.get_index("neurostack-rag-dev")
+            self.assertEqual(vectorstore._indexes, {})  # failure not cached; retried next time
+
     def test_delete_by_filter_stops_when_nothing_new(self):
         page = [{"id": "m1"}, {"id": "m2"}]
         with mock.patch.object(vectorstore, "query", return_value=page) as q, \

@@ -7,6 +7,7 @@ into empty strings, so a bad model name or key shows up in the Space logs.
 """
 import logging
 import os
+import re
 import threading
 import time
 from typing import Any, Dict, List, Optional
@@ -15,7 +16,11 @@ import requests
 
 logger = logging.getLogger(__name__)
 
-GROQ_MODEL = os.getenv("GROQ_MODEL", "meta-llama/llama-4-maverick-17b-128e-instruct")
+GROQ_MODEL = os.getenv("GROQ_MODEL", "openai/gpt-oss-120b")
+# Tried in order if the main model is retired or unavailable on the account.
+GROQ_FALLBACK_MODELS = [m.strip() for m in os.getenv("GROQ_FALLBACK_MODELS", "qwen/qwen3.8-27b").split(",") if m.strip()]
+# gpt-oss models "think" before answering; low keeps routing calls fast.
+GROQ_REASONING_EFFORT = os.getenv("GROQ_REASONING_EFFORT", "low")
 GROQ_API_KEY = os.getenv("GROQ_API_KEY")
 GROQ_URL = os.getenv("GROQ_URL", "https://api.groq.com/openai/v1/chat/completions")
 LLM_TIMEOUT = float(os.getenv("LLM_TIMEOUT", "25"))
@@ -24,10 +29,47 @@ LLM_MAX_ATTEMPTS = int(os.getenv("LLM_MAX_ATTEMPTS", "3"))
 RETRYABLE_STATUS = {429, 500, 502, 503, 504}
 
 _local = threading.local()
+_retired_models: set = set()  # models Groq said don't exist, skipped for this process
 
 
 class LLMError(RuntimeError):
     pass
+
+
+class _ModelUnavailable(LLMError):
+    pass
+
+
+def _models() -> List[str]:
+    seen, out = set(), []
+    for m in [GROQ_MODEL, *GROQ_FALLBACK_MODELS]:
+        if m not in seen and m not in _retired_models:
+            seen.add(m)
+            out.append(m)
+    return out
+
+
+def _is_reasoning(model: str) -> bool:
+    return model.startswith("openai/gpt-oss")
+
+
+def _model_params(model: str) -> Dict[str, Any]:
+    if _is_reasoning(model):
+        return {"reasoning_effort": GROQ_REASONING_EFFORT, "include_reasoning": False}
+    return {}
+
+
+# Reasoning models spend part of max_tokens "thinking" before they write
+# anything, so a tiny budget (e.g. 12 tokens for a domain label) comes back
+# empty. They still stop as soon as the answer is done.
+REASONING_MIN_TOKENS = 400
+
+# gpt-oss cites as 【1】 or 【1†source】; the frontend links [1].
+_CITATION_RE = re.compile(r"【(\d{1,2})(?:†[^】]*)?】")
+
+
+def _normalize(text: str) -> str:
+    return _CITATION_RE.sub(r"[\1]", text).strip()
 
 
 def _session() -> requests.Session:
@@ -40,15 +82,29 @@ def _session() -> requests.Session:
 
 def chat_completion(messages: List[Dict[str, str]], max_tokens: int = 512,
                     temperature: float = 0.2) -> str:
-    """Call Groq and return the assistant text. Raises LLMError."""
+    """Call Groq and return the assistant text, falling back across models. Raises LLMError."""
     if not GROQ_API_KEY:
         raise LLMError("GROQ_API_KEY not set")
 
+    last: Optional[LLMError] = None
+    for model in _models():
+        try:
+            return _complete_with(model, messages, max_tokens, temperature)
+        except _ModelUnavailable as e:
+            _retired_models.add(model)
+            logger.error("Groq model %s unavailable, trying the next one (set GROQ_MODEL to fix): %s", model, e)
+            last = e
+    raise last or LLMError("no Groq models available; set GROQ_MODEL")
+
+
+def _complete_with(model: str, messages: List[Dict[str, str]], max_tokens: int,
+                   temperature: float) -> str:
     payload = {
-        "model": GROQ_MODEL,
+        "model": model,
         "messages": messages,
-        "max_tokens": max_tokens,
+        "max_tokens": max(max_tokens, REASONING_MIN_TOKENS) if _is_reasoning(model) else max_tokens,
         "temperature": temperature,
+        **_model_params(model),
     }
     headers = {"Authorization": f"Bearer {GROQ_API_KEY}", "Content-Type": "application/json"}
 
@@ -73,12 +129,15 @@ def chat_completion(messages: List[Dict[str, str]], max_tokens: int = 512,
             continue
 
         if resp.status_code >= 400:
-            # 400/401/404 etc. won't fix themselves (bad key, decommissioned model…)
-            raise LLMError(f"HTTP {resp.status_code}: {resp.text[:300]}")
+            body = resp.text[:300]
+            if resp.status_code in (400, 404) and ("model_not_found" in body or "decommissioned" in body):
+                raise _ModelUnavailable(f"HTTP {resp.status_code}: {body}")
+            # 400/401 etc. won't fix themselves (bad key, bad request…)
+            raise LLMError(f"HTTP {resp.status_code}: {body}")
 
         try:
             data = resp.json()
-            return (data["choices"][0]["message"]["content"] or "").strip()
+            return _normalize(data["choices"][0]["message"]["content"] or "")
         except Exception as e:
             raise LLMError(f"unexpected response shape: {e}") from e
 
