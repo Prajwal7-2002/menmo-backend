@@ -1,0 +1,27 @@
+# Packages the code uses directly; constraints.txt pins the full resolved set.
+# torch is installed separately (CPU wheel) in the Dockerfile.
+
+# Django + API
+Django==5.2.8
+djangorestframework==3.16.1
+djangorestframework_simplejwt==5.5.1
+django-cors-headers==4.9.0
+gunicorn==21.2.0
+psycopg2-binary==2.9.11
+
+# Retrieval / embeddings
+sentence-transformers==5.1.2
+rank-bm25==0.2.2
+pinecone==8.0.0
+numpy==1.26.4  # not imported directly; torch 2.2 needs numpy 1.x
+
+# LLM + web search
+requests==2.32.5
+ddgs==9.16.0
+
+# Document parsing / OCR
+pdfplumber==0.11.8
+pypdf==6.3.0
+pdf2image==1.17.0
+pytesseract==0.3.13
+python-docx==1.2.0

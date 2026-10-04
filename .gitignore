@@ -1,0 +1,39 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# Virtual environments
+venv/
+env/
+ENV/
+
+# Django
+db.sqlite3
+media/
+staticfiles/
+*.log
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# IDE
+.vscode/
+.idea/
+
+# Cache
+*.cache
+
+#.env
+.env
+.environments
+.ENV
+
+
+api_app/management/commands/test_agent.py
+
+# Agent worktrees / local tooling
+.kilo/
+static/
