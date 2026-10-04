@@ -181,7 +181,7 @@ def generate_answer(question: str, mode: str, chunks: Optional[List[Dict[str, An
                     verbosity: str = "normal", max_tokens: Optional[int] = None) -> str:
     length_rule, default_tokens = VERBOSITY_STYLE.get(verbosity, VERBOSITY_STYLE["normal"])
     system = (
-        "You are NeuroStack, an assistant that answers questions about the user's uploaded "
+        "You are Mnemo, an assistant that answers questions about the user's uploaded "
         "documents and general topics.\n"
         f"{MODE_INSTRUCTIONS.get(mode, MODE_INSTRUCTIONS['general'])}\n"
         f"Tone: {TONE_STYLE.get(tone, TONE_STYLE['neutral'])}\n"

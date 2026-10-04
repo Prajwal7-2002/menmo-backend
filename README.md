@@ -1,5 +1,5 @@
 ---
-title: "NeuroStack Backend"
+title: "Mnemo Backend"
 emoji: "⚙️"
 colorFrom: "indigo"
 colorTo: "blue"
@@ -7,9 +7,9 @@ sdk: "docker"
 pinned: false
 ---
 
-# NeuroStack Backend
+# Mnemo Backend
 
-Django REST backend for NeuroStack: upload documents, then chat with them. Answers come from your
+Django REST backend for Mnemo: upload documents, then chat with them. Answers come from your
 documents when they're relevant, otherwise from a web search, otherwise from the LLM's general
 knowledge — and every response says which (`source`).
 
@@ -65,7 +65,7 @@ Optional:
 | Variable | Default | Purpose |
 |---|---|---|
 | `GROQ_MODEL` | `meta-llama/llama-4-maverick-17b-128e-instruct` | Groq model id |
-| `PINECONE_INDEX_NAME` / `PINECONE_MEMORY_INDEX` | `neurostack-rag` / `neurostack-memory` | Index names (384-dim) |
+| `PINECONE_INDEX_NAME` / `PINECONE_MEMORY_INDEX` | `neurostack-rag` / `neurostack-memory` | Index names (384-dim; kept from the project's earlier name so existing data stays reachable) |
 | `CORS_ALLOWED_ORIGINS` | *(all)* | Comma-separated frontend origins |
 | `DJANGO_ALLOWED_HOSTS` | Space host, `.hf.space`, localhost | Comma-separated |
 | `RAG_MIN_GOOD_SIM` / `RAG_MIN_WEAK_SIM` | `0.45` / `0.30` | Similarity needed to answer from documents |

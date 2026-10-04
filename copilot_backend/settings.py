@@ -131,7 +131,7 @@ if USE_POSTGRES:
             "OPTIONS": {
                 "sslmode": os.getenv("DB_SSLMODE", "require"),
                 "connect_timeout": 5,
-                "application_name": "neurostack_backend",
+                "application_name": "mnemo_backend",
             },
         }
     }
