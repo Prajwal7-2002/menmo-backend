@@ -4,6 +4,9 @@ set -e
 echo "Applying migrations..."
 python manage.py migrate --noinput
 
+echo "Creating cache table (throttle counters)..."
+python manage.py createcachetable
+
 echo "Collecting static files..."
 python manage.py collectstatic --noinput
 

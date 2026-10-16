@@ -142,6 +142,59 @@ class ConversationChatTests(BaseAPITest):
         self.memory.clear_memory_for_conversation.assert_called_once_with(self.user.id, str(self.conv.id))
 
 
+class AbuseLimitTests(BaseAPITest):
+    def setUp(self):
+        super().setUp()
+        self.conv = Conversation.objects.create(user=self.user)
+        self.url = f"/api/conversations/{self.conv.id}/chat/"
+
+    def test_overlong_message_rejected_before_any_llm_call(self):
+        res = self.client.post(self.url, {"query": "x" * 4001}, format="json")
+        self.assertEqual(res.status_code, 400)
+        self.assertIn("too long", res.data["detail"])
+        self.build_agent.assert_not_called()
+        self.assertEqual(self.llm.calls, [])
+
+    def test_daily_cap_per_user(self):
+        from api_app.throttles import AskDailyThrottle
+        with mock.patch.object(AskDailyThrottle, "THROTTLE_RATES", {"ask_daily": "2/day"}):
+            codes = [self.client.post(self.url, {"query": "hi"}, format="json").status_code for _ in range(3)]
+        self.assertEqual(codes, [200, 200, 429])
+
+    def test_counters_are_shared_across_workers(self):
+        from django.conf import settings
+        self.assertEqual(settings.CACHES["default"]["BACKEND"], "django.core.cache.backends.db.DatabaseCache")
+
+
+class ProxyAwareThrottleTests(APITestCase):
+    def setUp(self):
+        cache.clear()
+
+    def _logins(self, spoofed_values):
+        from rest_framework.throttling import ScopedRateThrottle
+        codes = []
+        with mock.patch.object(ScopedRateThrottle, "THROTTLE_RATES", {"auth": "2/min"}):
+            for spoof in spoofed_values:
+                # client-supplied value first, address appended by the (single) trusted proxy last
+                res = self.client.post("/auth/login/", {"username": "x", "password": "y"}, format="json",
+                                       HTTP_X_FORWARDED_FOR=f"{spoof}, 203.0.113.7")
+                codes.append(res.status_code)
+        return codes
+
+    def test_spoofed_header_cannot_dodge_limit_when_proxies_configured(self):
+        from django.test import override_settings
+        from django.conf import settings
+        with override_settings(REST_FRAMEWORK={**settings.REST_FRAMEWORK, "NUM_PROXIES": 1}):
+            self.assertEqual(self._logins(["1.1.1.1", "2.2.2.2", "3.3.3.3"]), [401, 401, 429])
+
+    def test_signup_daily_cap(self):
+        from api_app.throttles import SignupDailyThrottle
+        with mock.patch.object(SignupDailyThrottle, "THROTTLE_RATES", {"signup": "1/day"}):
+            ok = self.client.post("/auth/signup/", {"username": "u1", "password": "a-Strong-pass-42"}, format="json")
+            blocked = self.client.post("/auth/signup/", {"username": "u2", "password": "a-Strong-pass-42"}, format="json")
+        self.assertEqual((ok.status_code, blocked.status_code), (201, 429))
+
+
 class AskTests(BaseAPITest):
     def test_ask(self):
         res = self.client.post("/api/ask/", {"query": "what is GraphRAG"}, format="json")

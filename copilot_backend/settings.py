@@ -73,9 +73,24 @@ REST_FRAMEWORK = {
     'DEFAULT_THROTTLE_CLASSES': ('rest_framework.throttling.ScopedRateThrottle',),
     'DEFAULT_THROTTLE_RATES': {
         'ask': os.getenv("THROTTLE_ASK", "30/min"),
+        'ask_daily': os.getenv("THROTTLE_ASK_DAILY", "300/day"),
         'upload': os.getenv("THROTTLE_UPLOAD", "20/hour"),
         'auth': os.getenv("THROTTLE_AUTH", "10/min"),
+        'signup': os.getenv("THROTTLE_SIGNUP", "20/day"),
     },
+    # How many proxies sit in front of the app (Hugging Face's). Unset = trust nothing extra, which
+    # lets clients vary X-Forwarded-For to dodge per-IP limits; set it once the startup log shows the
+    # hop count (see copilot_backend/middleware.py).
+    'NUM_PROXIES': int(os.environ["TRUSTED_PROXIES"]) if os.getenv("TRUSTED_PROXIES") else None,
+}
+
+# Throttle counters live in the database so every gunicorn worker shares them and they survive
+# restarts (the default in-memory cache is per process). Created by `manage.py createcachetable`.
+CACHES = {
+    "default": {
+        "BACKEND": "django.core.cache.backends.db.DatabaseCache",
+        "LOCATION": "menmo_cache",
+    }
 }
 
 SIMPLE_JWT = {
@@ -85,6 +100,7 @@ SIMPLE_JWT = {
 }
 
 MIDDLEWARE = [
+    'copilot_backend.middleware.ProxyHopLogger',
     'corsheaders.middleware.CorsMiddleware',
     'django.middleware.security.SecurityMiddleware',
     'django.contrib.sessions.middleware.SessionMiddleware',

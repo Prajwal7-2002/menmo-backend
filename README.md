@@ -77,6 +77,8 @@ Optional:
 | `CHUNK_SIZE` / `CHUNK_OVERLAP` | `900` / `150` | Characters per chunk (new uploads only) |
 | `MAX_UPLOAD_MB` | `20` | Upload size limit |
 | `THROTTLE_ASK` / `THROTTLE_UPLOAD` / `THROTTLE_AUTH` | `30/min` / `20/hour` / `10/min` | Rate limits |
+| `THROTTLE_ASK_DAILY` / `THROTTLE_SIGNUP` | `300/day` / `20/day` | Daily message cap per user; new accounts per client |
+| `TRUSTED_PROXIES` | *(unset)* | Proxies in front of the app, so per-IP limits use the real client address. Set it to the X-Forwarded-For count the app logs at startup |
 | `GUNICORN_WORKERS` / `GUNICORN_THREADS` / `GUNICORN_TIMEOUT` | `2` / `4` / `180` | Server tuning |
 | `LOG_LEVEL` | `INFO` | |
 

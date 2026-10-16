@@ -21,7 +21,10 @@ from rag.models import ChunkFeedback, DocumentChunk, UploadedDocument
 from rag.retrieval import delete_chunks, delete_document_vectors
 from rag.tools.intent_classifier import classify_intent_and_route
 
-from .serializers import AskSerializer, FeedbackSerializer
+from rest_framework.throttling import ScopedRateThrottle
+
+from .serializers import MAX_QUERY_CHARS, AskSerializer, FeedbackSerializer
+from .throttles import AskDailyThrottle
 
 logger = logging.getLogger(__name__)
 
@@ -126,6 +129,7 @@ def answer_query(user, query: str, *, domain: Optional[str], document: Optional[
 
 class AskAPIView(APIView):
     permission_classes = [IsAuthenticated]
+    throttle_classes = [ScopedRateThrottle, AskDailyThrottle]
     throttle_scope = "ask"
 
     def post(self, request):
@@ -293,6 +297,7 @@ class ConversationListAPIView(APIView):
 
 class ConversationChatAPIView(APIView):
     permission_classes = [IsAuthenticated]
+    throttle_classes = [ScopedRateThrottle, AskDailyThrottle]
     throttle_scope = "ask"
 
     def post(self, request, cid):
@@ -303,6 +308,8 @@ class ConversationChatAPIView(APIView):
         query = (request.data.get("query") or "").strip()
         if not query:
             return Response({"detail": "empty prompt"}, status=400)
+        if len(query) > MAX_QUERY_CHARS:
+            return Response({"detail": f"Message is too long (max {MAX_QUERY_CHARS} characters)."}, status=400)
         try:
             document = _resolve_document(request.user, request.data.get("document_id"))
         except RequestError as e:

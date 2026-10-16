@@ -3,8 +3,12 @@ from rest_framework import serializers
 from .models import Feedback, QueryLog
 
 
+# Longest question accepted (characters); keeps prompts and LLM cost bounded.
+MAX_QUERY_CHARS = 4000
+
+
 class AskSerializer(serializers.Serializer):
-    query = serializers.CharField(max_length=4000)
+    query = serializers.CharField(max_length=MAX_QUERY_CHARS)
 
 
 class FeedbackSerializer(serializers.ModelSerializer):

@@ -3,6 +3,9 @@ from django.core.exceptions import ValidationError
 from rest_framework import generics
 from rest_framework.permissions import AllowAny, IsAuthenticated
 from rest_framework.response import Response
+from rest_framework.throttling import ScopedRateThrottle
+
+from api_app.throttles import SignupDailyThrottle
 
 from .serializers import SignupSerializer
 
@@ -10,6 +13,7 @@ from .serializers import SignupSerializer
 class SignupView(generics.CreateAPIView):
     serializer_class = SignupSerializer
     permission_classes = [AllowAny]
+    throttle_classes = [ScopedRateThrottle, SignupDailyThrottle]
     throttle_scope = "auth"
 
     def post(self, request, *args, **kwargs):
